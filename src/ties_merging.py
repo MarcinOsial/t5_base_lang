@@ -3,6 +3,10 @@ import sys, os
 print(f"Current working directory: {os.getcwd()}")
 sys.path.insert(0, os.getcwd())
 
+# Disable tokenizers parallelism to avoid warnings when using DataLoader with num_workers > 0
+# This prevents "The current process just got forked" warnings when workers inherit tokenizer state
+# Must be set BEFORE importing transformers or using tokenizers
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import wandb
 import argparse

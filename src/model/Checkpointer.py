@@ -72,27 +72,32 @@ class Checkpointer(object):
 
     def _is_bestCheckpoint(self, current_log):
         """
+        Check if current checkpoint has better score than the best so far.
+        Uses METRICS_PRIORITY to select the score to compare (score_to_select_checkpoint > loss > batch_idx).
 
         Args:
-            current_log:
+            current_log: Dictionary with metrics and scores from current checkpoint
 
         Returns:
-
+            True if current score is better than best score, False otherwise
         """
         current_score = getValueOfKey_inDictionary(current_log, METRICS_PRIORITY)
         return current_score > self.current_bestScore
 
     def _update_bestCheckpoint(self, current_log):
         """
+        Update best checkpoint score and reset patience counter.
+        Called when a new best checkpoint is found - resets the early stopping counter.
 
         Args:
-            current_log:
+            current_log: Dictionary with metrics and scores from current checkpoint
 
         Returns:
-
+            None
         """
         current_score = getValueOfKey_inDictionary(current_log, METRICS_PRIORITY)
         self.current_bestScore = current_score
+        # Reset patience counter when we find a better model
         self.numCheckpoints_sinceBestCheckpoint = 0
 
     def _save_checkpoint(self, model, save_fp):
@@ -207,6 +212,8 @@ class Checkpointer(object):
         """
         current_log = self._log_metricAndScores(batch_idx, scores)
 
+        # Increment patience counter at every checkpoint evaluation
+        # This counter tracks how many checkpoints have passed since the last best model
         self.numCheckpoints_sinceBestCheckpoint += 1
 
         if not dont_saveModel:
@@ -228,12 +235,22 @@ class Checkpointer(object):
             else:
                 if self._is_bestCheckpoint(current_log):
                     bestModel_fp = os.path.join(self.experiment_dir, "best_model.pt")
+                    # Print absolute path where best model is saved (for easy access after early stopping)
+                    abs_bestModel_fp = os.path.abspath(bestModel_fp)
+                    print(f"\n{'='*80}")
+                    print(f"SAVING BEST MODEL CHECKPOINT:")
+                    print(f"  Path: {abs_bestModel_fp}")
+                    print(f"  Experiment dir: {os.path.abspath(self.experiment_dir)}")
+                    print(f"{'='*80}\n")
                     self._save_checkpoint(model, bestModel_fp)
 
+        # Check if this is a new best checkpoint
+        # If yes, update best score and RESET patience counter to 0
         if self._is_bestCheckpoint(current_log):
-            self._update_bestCheckpoint(current_log)
+            self._update_bestCheckpoint(current_log)  # This resets numCheckpoints_sinceBestCheckpoint to 0
             self._update_and_save_best_mixing_weights(model, current_log)
 
+        # Return current log and patience counter for early stopping check
         return current_log, self.numCheckpoints_sinceBestCheckpoint
 
     def _update_and_save_best_mixing_weights(self, model, current_log):

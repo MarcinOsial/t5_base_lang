@@ -1,24 +1,74 @@
 import torch
 import copy
+import numpy as np
 from torch.utils import data
 
 
 class PytorchDataset(data.Dataset):
-    """Pytorch Dataset that returns a dictionary of tensors for each datapoint"""
+    """
+    Pytorch Dataset that returns a dictionary of tensors for each datapoint.
+    
+    If dataset is pre-tokenized (contains 'input_ids' field), returns it directly.
+    Otherwise, tokenizes on-the-fly (legacy mode for backward compatibility).
+    """
 
-    def __init__(self, dataset, tokenizer, device):
-
+    def __init__(self, dataset, tokenizer, device, is_pre_tokenized=None):
+        """
+        Initialize PytorchDataset.
+        
+        Args:
+            dataset: List of datapoints. If pre-tokenized, should contain 'input_ids', 'input_mask', etc.
+                    If not pre-tokenized, should contain 'input', 'target'/'answer_choices' (strings)
+            tokenizer: HuggingFace tokenizer (used only if not pre-tokenized)
+            device: Device for tensors (not used directly, kept for compatibility)
+            is_pre_tokenized: Whether dataset is pre-tokenized. If None, auto-detects from first example
+        """
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.device = device
+        
+        # Auto-detect if dataset is pre-tokenized
+        # Pre-tokenized datasets have 'input_ids' field (as numpy array or tensor)
+        if is_pre_tokenized is None:
+            self.is_pre_tokenized = (
+                len(dataset) > 0 
+                and "input_ids" in dataset[0]
+                and (isinstance(dataset[0]["input_ids"], (np.ndarray, torch.Tensor)))
+            )
+        else:
+            self.is_pre_tokenized = is_pre_tokenized
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, get_idx):
-        """Returns a dictionary tokenized inouts along with masks for each datapoint"""
-
+        """
+        Returns a dictionary tokenized inputs along with masks for each datapoint.
+        
+        If dataset is pre-tokenized, converts numpy arrays back to PyTorch tensors.
+        Otherwise, tokenizes on-the-fly (legacy mode).
+        """
         datapoint = self.dataset[get_idx]
+        
+        # If pre-tokenized, convert numpy arrays back to PyTorch tensors
+        if self.is_pre_tokenized:
+            new_datapoint = copy.deepcopy(datapoint)
+            
+            # Migrate old cache format: all_choices_masks -> all_choices_mask
+            # This handles cases where old cache wasn't migrated during loading
+            if "all_choices_masks" in new_datapoint and "all_choices_mask" not in new_datapoint:
+                new_datapoint["all_choices_mask"] = new_datapoint.pop("all_choices_masks")
+            
+            # Convert numpy arrays to PyTorch tensors
+            for key, value in new_datapoint.items():
+                if isinstance(value, np.ndarray):
+                    new_datapoint[key] = torch.from_numpy(value)
+                elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], np.ndarray):
+                    # Handle lists of numpy arrays (e.g., all_choices_ids, all_choices_masks)
+                    new_datapoint[key] = [torch.from_numpy(arr) for arr in value]
+            return new_datapoint
+        
+        # Legacy mode: tokenize on-the-fly (for backward compatibility)
         input_dict = self.tokenizer(
             datapoint["input"], return_tensors="pt", truncation=True
         )
@@ -116,13 +166,12 @@ class PytorchDataset(data.Dataset):
                     batch_ofValues, batch_first=True, padding_value=padToken_id
                 )
 
-                if self.device is not None:
-                    datapoint_batched[k] = datapoint_batched[k].to(self.device)
+                # Don't move to device here - do it in main process to avoid CUDA issues
+                # Device will be moved in training loop after collate_fn returns
 
             elif k == "lbl":
                 datapoint_batched[k] = torch.tensor(batch_ofValues)
 
-                if self.device is not None:
-                    datapoint_batched[k] = datapoint_batched[k].to(self.device)
+                # Don't move to device here - do it in main process to avoid CUDA issues
 
         return datapoint_batched

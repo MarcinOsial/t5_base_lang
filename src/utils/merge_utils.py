@@ -24,8 +24,8 @@ BASIC_INFORMATION = {
     },
     "t5-base": {
         "base_model": "t5-base",
-        "dump_dir": f"",
-        "load_dir": f"",
+        "dump_dir": f"/raid/NFS_SHARE/home/marcin.osial/ties-merging/dump_dir",
+        "load_dir": f"/raid/NFS_SHARE/home/marcin.osial/ties-merging/models",
     },
     "t5-large": {
         "base_model": "t5-large",

@@ -13,7 +13,7 @@ def generate_checkpointFilepath(
     pretrained_model,
     peft_method,
     checkpoint_to_directly_load_model,
-    basedir="",
+    basedir="/raid/NFS_SHARE/home/marcin.osial/ties-merging/models",
 ):
     if "+" in checkpoint_to_directly_load_model:
         if "checkpoint" in checkpoint_to_directly_load_model:

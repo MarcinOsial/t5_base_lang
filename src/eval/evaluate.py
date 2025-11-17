@@ -79,6 +79,24 @@ def evaluate_model(
 
     with torch.no_grad():
         for batch in tqdm(batch_iterator):
+            # CRITICAL: Move batch tensors to device (GPU) if not already there
+            # This fixes RuntimeError: Expected all tensors to be on the same device
+            if device is not None:
+                device_batch = {}
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        # Always move to device, even if already on device (ensures consistency)
+                        device_batch[k] = v.to(device, non_blocking=True)
+                    elif isinstance(v, list) and len(v) > 0:
+                        # Handle nested lists - check if first element is a tensor
+                        if isinstance(v[0], torch.Tensor):
+                            # Handle nested lists of tensors (e.g., all_choices_ids, all_choices_mask)
+                            device_batch[k] = [t.to(device, non_blocking=True) for t in v]
+                        else:
+                            device_batch[k] = v
+                    else:
+                        device_batch[k] = v
+                batch = device_batch
 
             batchOf_evalInfo = prepare_batchOfEvalInfo(batch)
 
@@ -180,6 +198,7 @@ def evaluate_fromConfig(
 
     createPytorchDataset_fn = lambda dataset: PytorchDataset(dataset, tokenizer, device)
 
+    # Use tokenization cache for evaluation (default max_seq_len=512 if not provided)
     batcher = Batcher(
         dataset_reader,
         createPytorchDataset_fn,
@@ -187,6 +206,9 @@ def evaluate_fromConfig(
         eval_batchSize=evaluation_config.eval_batch_size,
         world_size=evaluation_config.world_size,
         device=device,
+        tokenizer=tokenizer,  # Pass tokenizer for pre-tokenization cache
+        max_seq_len=512,  # Default max_seq_len (can be overridden if model_config available)
+        use_tokenization_cache=True,  # Enable tokenization cache to eliminate bottleneck
     )
     getBatches_fn = lambda batcher, template_idx: batcher.get_evalBatches(
         evaluation_config.split, template_idx
@@ -194,7 +216,23 @@ def evaluate_fromConfig(
 
     # Only node zero should get the prediction dir in case the prediction dir
     # doesn't exist and it must be created in getAndMake_specificPredictionDir
+    # Validate prediction_dir before using it
     if is_nodeZero(device):
+        if evaluation_config.prediction_dir is None:
+            raise ValueError(
+                f"evaluation_config.prediction_dir is None in evaluate_fromConfig. "
+                f"This should not happen if evaluate_checkpoint properly sets prediction_dir. "
+                f"Check that experiment_dir is set in TrainingConfig and that prediction_dir "
+                f"is properly passed through MultiEvaluationConfig.get_allConfigs()."
+            )
+        # DEBUG: Print all values before calling getAndMake_specificPredictionDir
+        print(f"[DEBUG evaluate_fromConfig] Before getAndMake_specificPredictionDir call:")
+        print(f"  evaluation_config.prediction_dir = {evaluation_config.prediction_dir} (type: {type(evaluation_config.prediction_dir)})")
+        print(f"  evaluation_config.split = {evaluation_config.split} (type: {type(evaluation_config.split)})")
+        print(f"  evaluation_config.inference_dataset = {evaluation_config.inference_dataset} (type: {type(evaluation_config.inference_dataset)})")
+        print(f"  evaluation_config.eval_template_idx = {evaluation_config.eval_template_idx} (type: {type(evaluation_config.eval_template_idx)})")
+        print(f"  evaluation_config object: {evaluation_config}")
+        
         specificPrediction_dir = getAndMake_specificPredictionDir(
             evaluation_config.prediction_dir,
             evaluation_config.split,

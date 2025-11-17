@@ -35,7 +35,8 @@ def construct_optimizer(
     parameters, names = get_modelParameters(
         model, trainableParameter_regex, return_names=True
     )
-    logger.info(f"Training the parameters: {names}")
+    # Commented out to reduce log verbosity - prints very long list of parameter names
+    # logger.info(f"Training the parameters: {names}")
 
     if optimizer_name.lower() == "adam":
         optimizer = optim.Adam(
