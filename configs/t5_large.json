@@ -1,5 +1,5 @@
 {
-    "pretrained_model": "t5-large",
+    "pretrained_model": "google/t5-large-lm-adapt",
     "inference_dataset_mixture": "t5_mixture",
     "train_dataset_mixture": "t5_mixture",
     "eval_template_idx": 0,

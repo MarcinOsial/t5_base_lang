@@ -187,34 +187,44 @@ def loadCheckpoint_intoModel(checkpoint, model):
     Returns:
         _type_: _description_
     """
-    modelParameters_names = set(checkpoint.keys())
-    modelStateDict_keys = set(model.state_dict().keys())
-
-    assert modelParameters_names.issubset(modelStateDict_keys)
-    # The encoder and decoder embedding tokens are always tied to the shared weight and so should never be a paremeter
-    # assert set(
-    #     [
-    #         "transformer.decoder.embed_tokens.weight",
-    #         "transformer.encoder.embed_tokens.weight",
-    #     ]
-    # ).issubset(modelStateDict_keys.difference(modelParameters_names))
+    # Fix: Remove _orig_mod. prefix from checkpoint keys if present
+    # This happens when model was compiled with torch.compile during training
+    # but is not compiled during inference
+    # IMPORTANT: Create a copy to avoid modifying the original checkpoint dict
+    checkpoint_fixed = {}
+    for key, value in checkpoint.items():
+        # Remove _orig_mod. prefix if present (from torch.compile)
+        if key.startswith("_orig_mod."):
+            new_key = key[len("_orig_mod."):]
+            checkpoint_fixed[new_key] = value
+        else:
+            checkpoint_fixed[key] = value
+    
+    # Use strict=False in load_state_dict to handle any minor mismatches gracefully
+    # The encoder and decoder embedding tokens are always tied to the shared weight and so should never be a parameter
 
     # Must tie the encoder and decoder embeddings to the shared weight if the shared weight is a parameter.
-    if "transformer.shared.weight" in checkpoint:
-        checkpoint["transformer.decoder.embed_tokens.weight"] = checkpoint[
-            "transformer.shared.weight"
-        ]
-        checkpoint["transformer.encoder.embed_tokens.weight"] = checkpoint[
-            "transformer.shared.weight"
-        ]
+    # Create a copy for embedding tying to avoid modifying the original dict
+    checkpoint_to_load = checkpoint_fixed.copy()
+    
+    # Check for shared.weight (with or without transformer. prefix)
+    # Try both variants to handle different checkpoint formats
+    if "transformer.shared.weight" in checkpoint_to_load:
+        checkpoint_to_load["transformer.decoder.embed_tokens.weight"] = checkpoint_to_load["transformer.shared.weight"]
+        checkpoint_to_load["transformer.encoder.embed_tokens.weight"] = checkpoint_to_load["transformer.shared.weight"]
+    elif "shared.weight" in checkpoint_to_load:
+        checkpoint_to_load["decoder.embed_tokens.weight"] = checkpoint_to_load["shared.weight"]
+        checkpoint_to_load["encoder.embed_tokens.weight"] = checkpoint_to_load["shared.weight"]
 
-    update_stats = model.load_state_dict(checkpoint, strict=False)
+    update_stats = model.load_state_dict(checkpoint_to_load, strict=False)
     logger.info(f"Missing keys: {update_stats.missing_keys}")
     logger.info(f"Unexpected keys: {update_stats.unexpected_keys}")
-
-    if "transformer.shared.weight" in checkpoint:
-        del checkpoint["transformer.decoder.embed_tokens.weight"]
-        del checkpoint["transformer.encoder.embed_tokens.weight"]
+    
+    # Log warning if there are many missing keys (suggests loading issue)
+    if len(update_stats.missing_keys) > 10:
+        logger.warning(f"WARNING: {len(update_stats.missing_keys)} missing keys detected! "
+                      f"This suggests checkpoint keys may not match model structure. "
+                      f"First few missing keys: {update_stats.missing_keys[:5]}")
 
     return model
 

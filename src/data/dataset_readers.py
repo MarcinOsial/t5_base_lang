@@ -166,15 +166,32 @@ class DatasetReader(object):
                 orig_data.append(example)
 
             if split.lower() in ["validation", "test"]:
+                total_validation_samples = len(orig_data)
+                logger.info(
+                    f"[DATASET SPLIT INFO] {self.name.upper()}: "
+                    f"Loaded {total_validation_samples} samples from HuggingFace validation split"
+                )
+                
                 if len(orig_data) > self.num_val_samples:
                     orig_val_data, orig_test_data = self._split_val_into_val_and_test(
                     orig_data, self.num_val_samples
                 )
+                    logger.info(
+                        f"[DATASET SPLIT INFO] {self.name.upper()}: "
+                        f"Split into validation ({len(orig_val_data)} samples, first {self.num_val_samples}) "
+                        f"and test ({len(orig_test_data)} samples, remaining {total_validation_samples - self.num_val_samples})"
+                    )
                 else:
                     print(f"Validation/Test split is too small. {len(orig_data)} < {self.num_val_samples}")
                     print("splitting equally")
+                    num_val = len(orig_data)//2
                     orig_val_data, orig_test_data = self._split_val_into_val_and_test(
-                        orig_data, len(orig_data)//2
+                        orig_data, num_val
+                    )
+                    logger.info(
+                        f"[DATASET SPLIT INFO] {self.name.upper()}: "
+                        f"Split equally: validation ({len(orig_val_data)} samples) "
+                        f"and test ({len(orig_test_data)} samples)"
                     )
 
                 self.cached_origData["validation"] = orig_val_data
@@ -182,7 +199,14 @@ class DatasetReader(object):
             else:
                 self.cached_origData[split] = orig_data
 
-        return self.cached_origData[split]
+        # Log which split is being returned and how many samples it contains
+        returned_split = self.cached_origData[split]
+        logger.info(
+            f"[DATASET USAGE INFO] {self.name.upper()}: "
+            f"Using split '{split}' with {len(returned_split)} samples for evaluation"
+        )
+        
+        return returned_split
 
     def _read_few_shot_dataset(
         self,
@@ -487,6 +511,11 @@ class DatasetReader(object):
             )
             logger.info(
                 f"\tDataset:{self.name.upper()}\tSplit:{split}\tSelected Examples: {len(orig_data)}\tNum Total Example:{total_examples}"
+            )
+            logger.info(
+                f"[EVALUATION INFO] {self.name.upper()}: "
+                f"Will evaluate on {len(orig_data)} samples from split '{split}' "
+                f"(out of {total_examples} total available for this split)"
             )
             
             # Compute hash for cache validation

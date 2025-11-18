@@ -1,1 +1,16 @@
 __pycache__
+
+.cache/
+.history/
+.wandb/
+
+*.md
+datasets/
+exp_out/
+models/
+*.out
+wandb/
+
+T5_Large/
+env/
+

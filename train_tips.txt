@@ -1,0 +1,14 @@
+C.6 Training DetailsIn our research, we utilized two variants of the T5 model, specifically the T5-base and T5-large
+models, which were trained to a maximum of 75,000 steps. An effective training batch size of 1024
+was implemented, alongside a learning rate (lr) of 0.0001. We instituted an early stopping mechanism
+with a patience threshold of 5 to prevent overfitting. During the training process, bfloat16 was adopted
+to curtail GPU memory expenditure, and the maximum sequence length was set at 128. In contrast,
+for the PEFT configuration of the (IA)3 approach on the T0-3B model, we modified our parameters.
+An effective training batch size of 16 was deployed along with an evaluation batch size of 32, while
+maintaining the learning rate at 0.0001. To accommodate the model’s complexity, the early stopping
+patience was augmented to 10. We do not use any lr scheduler and weight decay for any of our model
+training.
+For the purpose of evaluation, we perform rank classification. In this method, the model’s log
+probabilities for all potential label strings are ranked. The model’s prediction is deemed accurate if
+the choice ranked highest aligns with the correct answer. It should be noted that rank classification
+evaluation can accommodate both classification tasks and multiple-choice tasks.
