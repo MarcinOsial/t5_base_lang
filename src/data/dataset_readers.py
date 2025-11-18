@@ -792,6 +792,9 @@ class WinograndeReader(DatasetReader):
         logger.info(f"Cache cleanup completed. Removed {removed_count} items.")
 
     def _read_origin_dataset(self, split):
+        # Winogrande test split has no answers (all answer fields are empty)
+        # So we map "test" to "validation" and split validation into validation/test
+        # This is the same approach as before - test split in HuggingFace is for official evaluation only
         load_split = "validation" if split == "test" else split
         load_split = "validation" if load_split == "validation_full" else load_split
 
@@ -812,6 +815,7 @@ class WinograndeReader(DatasetReader):
             }
             
             # Load dataset directly from parquet files, bypassing the problematic loading script
+            # Use load_split (which maps "test" to "validation") because test split has no answers
             huggingFace_data = load_dataset(
                 'parquet',
                 data_files=data_files,
@@ -1091,7 +1095,10 @@ class WSCReader(DatasetReader):
         """
         Ładuje dataset WSC bezpośrednio z plików parquet, omijając problemy
         z cache HuggingFace datasets. Podobne podejście jak w WinograndeReader i PAWSReader.
+        WSC test split has label=-1 (no answers), so we map "test" to "validation" and split it.
         """
+        # WSC test split has label=-1 (no answers) - all 146 examples have label=-1
+        # So we map "test" to "validation" and split validation into validation/test
         load_split = "validation" if split == "test" else split
         load_split = "validation" if load_split == "validation_full" else load_split
 
@@ -1105,6 +1112,7 @@ class WSCReader(DatasetReader):
                 'test': 'https://huggingface.co/datasets/super_glue/resolve/main/wsc/test-00000-of-00001.parquet'
             }
             
+            # Use load_split (which maps "test" to "validation") because test split has label=-1 (no answers)
             huggingFace_data = load_dataset(
                 'parquet',
                 data_files=data_files,
@@ -1437,11 +1445,13 @@ class QASCReader(DatasetReader):
         }
 
     def _read_origin_dataset(self, split):
-
+        # QASC test split has no answers (all answerKey fields are empty - 0/920 have answers)
+        # So we map "test" to "validation" and split validation into validation/test
         load_split = "validation" if split == "test" else split
         load_split = "validation" if load_split == "validation_full" else load_split
 
         if split not in self.cached_origData:
+            # Use load_split (which maps "test" to "validation") because test split has no answerKey
             huggingFace_data = load_dataset(
                 *self.dataset_stash,
                 split=load_split,

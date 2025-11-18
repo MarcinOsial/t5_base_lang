@@ -34,6 +34,7 @@ class EvaluationConfig(Config):
         self.world_size = None
 
         self.did_run_finish = False
+        self.skip_cache = True  # Always recompute, don't use cached predictions
 
         if configDict_toInitializeFrom is not None:
             super()._update_fromDict(

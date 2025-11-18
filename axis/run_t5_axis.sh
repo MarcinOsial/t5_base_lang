@@ -47,8 +47,24 @@ pool=(
 # end_index: number of source datasets to end at (exclusive, 1 = only 1 source dataset)
 # Example: resume_from_idx=0, end_index=1 → source: [paws], targets: [qasc, quartz, story_cloze, wiki_qa, winogrande, wsc]
 # Example: resume_from_idx=0, end_index=2 → source: [paws], then [paws, qasc], with all possible targets
-RESUME_IDXs=(0 1 3 4 5)
-END_IDXs=(1 2 3 4 5 6) # Test with 1 source dataset first, then can increase to 2, 3, etc.
+# RESUME_IDXs=(5)
+# END_IDXs=(6) # Test with 1 source dataset first, then can increase to 2, 3, etc.
+
+# RESUME_IDXs=(4)
+# END_IDXs=(5) # Test with 1 source dataset first, then can increase to 2, 3, etc.
+
+# RESUME_IDXs=(3)
+# END_IDXs=(4) # Test with 1 source dataset first, then can increase to 2, 3, etc.
+
+RESUME_IDXs=(2)
+END_IDXs=(3) # Test with 1 source dataset first, then can increase to 2, 3, etc.
+
+# RESUME_IDXs=(1)
+# END_IDXs=(2) # Test with 1 source dataset first, then can increase to 2, 3, etc.
+
+# RESUME_IDXs=(0)
+# END_IDXs=(1) # Test with 1 source dataset first, then can increase to 2, 3, etc.
+
 
 # SVD thresholds to test
 SVD_THRESHOLDS=(0.1)

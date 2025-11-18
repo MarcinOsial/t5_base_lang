@@ -1,13 +1,15 @@
 from tqdm import tqdm
 import logging
 import torch.distributed as dist
+import os
+import json
 
 from src.data.dataset_readers import get_datasetReader
 from src.data.Batcher import Batcher
 from src.data.PytorchDataset import PytorchDataset
 
 from src.eval.utils import prepare_batchOfEvalInfo, getAndMake_specificPredictionDir
-from src.eval.cache import getCached_predictions, does_cachePredictionExist
+from src.eval.cache import getCached_predictions, does_cachePredictionExist, get_predictionFP
 from src.eval.Evaluator import Evaluator
 
 
@@ -42,27 +44,54 @@ def evaluate_model(
     logger.info(f"\tEvaluating model on {evaluation_config.inference_dataset} dataset")
 
     if is_nodeZero(device):
-        (
-            canUseCached_predictionFP,
-            cached_evaluationConfigDict_toUse,
-            prediction_fp,
-        ) = does_cachePredictionExist(
-            evaluation_config,
-            specificPrediction_dir,
-            keys_mustMatch=[
-                "use_bfloat16_during_eval",
-                "max_gen_len",
-                "few_shot_random_seed",
-            ],
-        )
-
-        if canUseCached_predictionFP:
-            return getCached_predictions(
-                evaluation_config,
+        # Skip cache if skip_cache is True (default behavior - always recompute)
+        skip_cache = getattr(evaluation_config, 'skip_cache', True)
+        
+        prediction_fp = None
+        canUseCached_predictionFP = False
+        
+        if not skip_cache:
+            (
+                canUseCached_predictionFP,
                 cached_evaluationConfigDict_toUse,
                 prediction_fp,
-                metrics,
+            ) = does_cachePredictionExist(
+                evaluation_config,
+                specificPrediction_dir,
+                keys_mustMatch=[
+                    "use_bfloat16_during_eval",
+                    "max_gen_len",
+                    "few_shot_random_seed",
+                ],
             )
+
+            if canUseCached_predictionFP:
+                return getCached_predictions(
+                    evaluation_config,
+                    cached_evaluationConfigDict_toUse,
+                    prediction_fp,
+                    metrics,
+                )
+        else:
+            # Cache is disabled - always recompute
+            logger.info("Cache disabled (skip_cache=True) - computing predictions from scratch")
+        
+        # Get prediction_fp for evaluator (either from cache check or create new)
+        # If skip_cache is True, or if cache check didn't find usable cache, create new prediction_fp
+        if skip_cache or not canUseCached_predictionFP:
+            evaluationRuns_fp = os.path.join(specificPrediction_dir, "evaluation_runs.json")
+            if os.path.exists(evaluationRuns_fp):
+                evaluationConfigDict_runs = json.load(open(evaluationRuns_fp, "r"))
+                idxOf_predictionFP = len(evaluationConfigDict_runs)
+            else:
+                evaluationConfigDict_runs = []
+                idxOf_predictionFP = 0
+            
+            # Add new evaluation config to runs (required by Evaluator.updateCache_runFinished)
+            evaluationConfigDict_runs.append(evaluation_config.get_dict())
+            json.dump(evaluationConfigDict_runs, open(evaluationRuns_fp, "w+"))
+            
+            prediction_fp = get_predictionFP(specificPrediction_dir, idxOf_predictionFP)
 
         # evaluator must be created after checking if the cache of model predictions exists,
         # since evaluator creates the prediction fp

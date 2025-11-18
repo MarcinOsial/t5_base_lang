@@ -1001,17 +1001,158 @@ def train_t5_axis(
     model.train()
     
     # Early stopping variables
-    best_val_loss = float('inf')
+    # Use accuracy instead of loss for early stopping (validation batches have all_choices_ids, not target_ids)
+    best_val_accuracy = -1.0  # Start with -1 (worse than any possible accuracy)
     num_checkpoints_since_best = 0
     batches_seen = 0
     early_stopping_triggered = False
     
+    # Create EvalWrapper for early stopping (needed for predict_mulChoice)
+    # We define it here so it can be used in early stopping evaluation
+    class EvalWrapper(nn.Module):
+        def __init__(self, model, tokenizer):
+            super().__init__()
+            self.model = model
+            self.tokenizer = tokenizer
+        
+        def forward(self, batch):
+            logits = self.model(batch)
+            loss, metrics = compute_loss_from_logits(
+                logits,
+                batch['target_ids'],
+                batch['target_mask']
+            )
+            return loss, metrics
+        
+        def _broadcast_tensors(self, input_masks, encoder_outputs, num_choices):
+            """Broadcast the input masks and encoder outputs to account for multiple choices per input"""
+            input_masks = torch.repeat_interleave(input_masks, num_choices, dim=0)
+            broadcasted_hidden_states = torch.repeat_interleave(encoder_outputs[0], num_choices, dim=0)
+            broadcasted_encoder_outputs = BaseModelOutput(
+                last_hidden_state=broadcasted_hidden_states,
+                hidden_states=getattr(encoder_outputs, 'hidden_states', None),
+                attentions=getattr(encoder_outputs, 'attentions', None),
+            )
+            return input_masks, broadcasted_encoder_outputs
+        
+        def compute_logProb(
+            self,
+            logProbs_ofAllChoices_ids,
+            allChoices_masks,
+            num_choices,
+            maxChoice_len,
+            length_normalization,
+        ):
+            """Compute log probabilities for all choices"""
+            logProbs_ofAllChoices_ids = logProbs_ofAllChoices_ids.reshape(
+                -1, num_choices, maxChoice_len
+            )
+            allChoices_masks = allChoices_masks.reshape(-1, num_choices, maxChoice_len)
+            logProbs_ofAllChoicesIds_zeroOutPadIds = (
+                logProbs_ofAllChoices_ids * allChoices_masks
+            )
+            
+            logProbs_ofAllChoices = torch.sum(logProbs_ofAllChoicesIds_zeroOutPadIds, dim=2)
+            len_allChoices = torch.sum(allChoices_masks, dim=2)
+            
+            if length_normalization:
+                logProbs_ofAllChoices = logProbs_ofAllChoices / len_allChoices
+            
+            return (
+                logProbs_ofAllChoices,
+                logProbs_ofAllChoicesIds_zeroOutPadIds,
+                len_allChoices,
+            )
+        
+        def compute_logProb_ofAllChoices(
+            self,
+            input_ids,
+            input_masks,
+            allChoices_ids,
+            allChoices_masks,
+            length_normalization,
+        ):
+            """Computes log probabilities for all the choices using model with learnable singular values"""
+            from transformers.modeling_outputs import BaseModelOutput
+            
+            base_transformer = self.model.model.transformer
+            encoder_outputs = base_transformer.get_encoder()(input_ids, attention_mask=input_masks)
+            
+            assert allChoices_ids.shape[0] % input_masks.shape[0] == 0, (
+                f"The batch size {allChoices_ids.shape[0]} of allChoices_ids is not a multiple of "
+                f"the batch size {input_masks.shape[0]} of input_masks"
+            )
+            
+            num_choices = allChoices_ids.shape[0] // input_masks.shape[0]
+            
+            # Broadcast input masks and encoder outputs for all choices
+            input_masks, encoder_outputs = self._broadcast_tensors(
+                input_masks, encoder_outputs, num_choices
+            )
+            
+            # Use model with learnable singular values, passing encoder_outputs for efficiency
+            all_choices_batch = {
+                "input_ids": input_ids.repeat_interleave(num_choices, dim=0),
+                "input_mask": input_masks,
+                "target_ids": allChoices_ids,
+                "target_mask": allChoices_masks,
+            }
+            
+            # Call model forward with encoder_outputs to reuse encoder and use learnable SVs in decoder
+            logits_ofAllChoices = self.model(all_choices_batch, encoder_outputs=encoder_outputs)
+            
+            maxChoice_len = logits_ofAllChoices.shape[1]
+            vocab_size = logits_ofAllChoices.shape[-1]
+            
+            # Compute the log probability of the ids for all choices with respect to the logits
+            logProbs_ofAllChoices_ids = -F.cross_entropy(
+                logits_ofAllChoices.view(-1, vocab_size),
+                allChoices_ids.view(-1),
+                reduction="none",
+            )
+            
+            return self.compute_logProb(
+                logProbs_ofAllChoices_ids,
+                allChoices_masks,
+                num_choices,
+                maxChoice_len,
+                length_normalization,
+            )
+        
+        def predict_mulChoice(self, batch, length_normalization):
+            """Predict multiple choice answers"""
+            from src.utils.utils import round_nestedList
+            
+            (
+                score_ofChoices,
+                logProbs_ofAllChoicesIds,
+                len_allChoices,
+            ) = self.compute_logProb_ofAllChoices(
+                batch["input_ids"],
+                batch["input_mask"],
+                batch["all_choices_ids"],
+                batch["all_choices_mask"],
+                length_normalization,
+            )
+            
+            _, predicted_choice = torch.max(score_ofChoices, dim=1)
+            
+            return (
+                predicted_choice.cpu().numpy().tolist(),
+                round_nestedList(score_ofChoices.cpu().numpy().tolist(), 5),
+                round_nestedList(logProbs_ofAllChoicesIds.cpu().numpy().tolist(), 4),
+                len_allChoices.cpu().numpy().tolist(),
+            )
+    
     # Get validation iterator for early stopping evaluation
+    # NOTE: For T5 multiple choice datasets, validation batches have 'all_choices_ids' instead of 'target_ids'
+    # So we use accuracy on validation set for early stopping instead of loss
     val_iterator = None
     if training_config.early_stopping and training_config.should_eval_validation:
         try:
+            # Use validation batches for early stopping (they have all_choices_ids for accuracy computation)
             val_iterator = batcher.get_evalBatches("validation", training_config.eval_template_idx)
-            print(f"✓ Validation iterator created for early stopping")
+            print(f"✓ Validation iterator created for early stopping (using validation set for accuracy-based early stopping)")
         except Exception as e:
             print(f"⚠ Warning: Could not create validation iterator: {e}")
             print(f"  Early stopping will be disabled")
@@ -1056,40 +1197,96 @@ def train_t5_axis(
             val_iterator is not None and
             (batch_idx + 1) % training_config.checkpoint_frequency == 0):
             
-            # Evaluate on validation set
+            # Evaluate on validation set using accuracy (validation batches have all_choices_ids for multiple choice)
             model.eval()
-            val_losses = []
+            val_correct = 0
+            val_total = 0
             with torch.no_grad():
                 # Evaluate on a few validation batches (limit to avoid long evaluation)
                 for val_batch_idx, val_batch in enumerate(val_iterator):
                     if val_batch_idx >= 10:  # Limit to 10 validation batches for speed
                         break
-                    if training_config.use_bfloat16_during_eval:
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            val_logits = model(val_batch)
-                            val_loss, _ = compute_loss_from_logits(
-                                val_logits,
-                                val_batch['target_ids'],
-                                val_batch['target_mask']
+                    
+                    # Check if batch has required fields for multiple choice evaluation
+                    required_fields = ['input_ids', 'input_mask', 'all_choices_ids', 'all_choices_mask', 'idx']
+                    missing_fields = [f for f in required_fields if f not in val_batch]
+                    if missing_fields:
+                        # Skip this batch if it doesn't have required fields
+                        if val_batch_idx == 0:
+                            print(f"    ⚠ Warning: Validation batch missing fields: {missing_fields}. Skipping validation batches.")
+                        continue
+                    
+                    # Ensure batch tensors are on correct device
+                    val_batch_on_device = {}
+                    for k, v in val_batch.items():
+                        if isinstance(v, torch.Tensor):
+                            val_batch_on_device[k] = v.to(device)
+                        elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
+                            val_batch_on_device[k] = [t.to(device) for t in v]
+                        else:
+                            val_batch_on_device[k] = v
+                    
+                    try:
+                        # Use EvalWrapper to compute predictions (it has predict_mulChoice method)
+                        eval_model = EvalWrapper(model, tokenizer)
+                        if training_config.use_bfloat16_during_eval:
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                predicted_choice, _, _, _ = eval_model.predict_mulChoice(
+                                    val_batch_on_device,
+                                    length_normalization=getattr(training_config, 'length_normalization', False)
+                                )
+                        else:
+                            predicted_choice, _, _, _ = eval_model.predict_mulChoice(
+                                val_batch_on_device,
+                                length_normalization=getattr(training_config, 'length_normalization', False)
                             )
-                    else:
-                        val_logits = model(val_batch)
-                        val_loss, _ = compute_loss_from_logits(
-                            val_logits,
-                            val_batch['target_ids'],
-                            val_batch['target_mask']
-                        )
-                    val_losses.append(val_loss.item())
+                        
+                        # Get correct answers from dataset_reader using idx
+                        # Handle both tensor and list types for idx
+                        idx_data = val_batch_on_device['idx']
+                        if isinstance(idx_data, torch.Tensor):
+                            batch_indices = idx_data.cpu().numpy()
+                        elif isinstance(idx_data, list):
+                            # Convert list to numpy array directly
+                            batch_indices = np.array(idx_data)
+                        else:
+                            # Fallback: try to convert to numpy array
+                            batch_indices = np.array([idx_data])
+                        for i, idx in enumerate(batch_indices):
+                            # Get the datapoint from dataset_reader to find correct answer
+                            dataset = dataset_reader.get_dataset("validation", training_config.eval_template_idx, is_evaluation=True)
+                            if idx < len(dataset):
+                                datapoint = dataset[idx]
+                                # Find correct choice index
+                                # For multiple choice, we need to find which choice matches the target
+                                if 'answer_choices' in datapoint and 'target' in datapoint:
+                                    target_text = datapoint['target']
+                                    answer_choices = datapoint['answer_choices']
+                                    try:
+                                        correct_choice_idx = answer_choices.index(target_text)
+                                        if predicted_choice[i] == correct_choice_idx:
+                                            val_correct += 1
+                                        val_total += 1
+                                    except (ValueError, IndexError):
+                                        # Skip if target not in choices or index out of range
+                                        continue
+                    except Exception as e:
+                        # Skip this batch if there's an error
+                        print(f"    ⚠ Warning: Skipping validation batch {val_batch_idx} due to error: {e}")
+                        import traceback
+                        if val_batch_idx == 0:
+                            traceback.print_exc()
+                        continue
             
-            if val_losses:
-                avg_val_loss = sum(val_losses) / len(val_losses)
-                print(f"\n  Checkpoint at batch {batch_idx + 1}: Validation loss = {avg_val_loss:.4f}")
+            if val_total > 0:
+                val_accuracy = val_correct / val_total
+                print(f"\n  Checkpoint at batch {batch_idx + 1}: Validation accuracy = {val_accuracy:.4f} ({val_correct}/{val_total})")
                 
-                # Check if this is the best validation loss
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
+                # Check if this is the best validation accuracy
+                if val_accuracy > best_val_accuracy:
+                    best_val_accuracy = val_accuracy
                     num_checkpoints_since_best = 0
-                    print(f"    ✓ New best validation loss: {best_val_loss:.4f}")
+                    print(f"    ✓ New best validation accuracy: {best_val_accuracy:.4f}")
                 else:
                     num_checkpoints_since_best += 1
                     print(f"    No improvement ({num_checkpoints_since_best}/{training_config.early_stopping_num_checkpoints_without_improvement})")
@@ -1099,7 +1296,7 @@ def train_t5_axis(
                     print(f"\n{'='*80}")
                     print(f"EARLY STOPPING TRIGGERED!")
                     print(f"  Patience threshold ({training_config.early_stopping_num_checkpoints_without_improvement} checkpoints) reached.")
-                    print(f"  Best validation loss: {best_val_loss:.4f}")
+                    print(f"  Best validation accuracy: {best_val_accuracy:.4f}")
                     print(f"  Batches seen: {batches_seen}/{training_config.num_batches}")
                     print(f"{'='*80}\n")
                     early_stopping_triggered = True
