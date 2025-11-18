@@ -8,12 +8,17 @@ This module implements the AXIS method for T5-base models:
 
 import os
 import hashlib
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from transformers import AutoModelForSeq2SeqLM
 from transformers.modeling_outputs import BaseModelOutput
+
+# Suppress tokenizer warnings about parallelism and forking
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+warnings.filterwarnings('ignore', message='.*tokenizers.*', category=UserWarning)
 
 from axis.t5_task_vectors import T5TaskVector
 
@@ -1006,6 +1011,25 @@ def train_t5_axis(
     num_checkpoints_since_best = 0
     batches_seen = 0
     early_stopping_triggered = False
+    current_training_loss = None  # Track current training loss for logging
+    
+    # Create training log file for validation accuracy tracking
+    training_log_path = os.path.join(experiment_dir, "training_log.txt")
+    with open(training_log_path, 'w') as f:
+        f.write("Training Log - Validation Accuracy Tracking\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Source datasets: {source_datasets}\n")
+        f.write(f"Target dataset: {target_dataset_name}\n")
+        f.write(f"SVD threshold: {svd_threshold}\n")
+        f.write(f"Seed: {seed}\n")
+        if training_config.early_stopping:
+            f.write(f"Early stopping: enabled (patience={training_config.early_stopping_num_checkpoints_without_improvement})\n")
+        else:
+            f.write(f"Early stopping: disabled (validation monitoring only)\n")
+        f.write("=" * 80 + "\n")
+        f.write("Format: Batch | Training Loss | Current Accuracy | Best Accuracy | Patience Counter | Status\n")
+        f.write("-" * 80 + "\n")
+    print(f"✓ Training log file created: {training_log_path}")
     
     # Create EvalWrapper for early stopping (needed for predict_mulChoice)
     # We define it here so it can be used in early stopping evaluation
@@ -1144,19 +1168,31 @@ def train_t5_axis(
                 len_allChoices.cpu().numpy().tolist(),
             )
     
-    # Get validation iterator for early stopping evaluation
+    # Get validation iterator for evaluation (even if early stopping is disabled, we still want to show validation metrics)
     # NOTE: For T5 multiple choice datasets, validation batches have 'all_choices_ids' instead of 'target_ids'
-    # So we use accuracy on validation set for early stopping instead of loss
+    # So we use accuracy on validation set for evaluation
+    # IMPORTANT: We use 'lbl' field from batches (same as Scorer in evaluate.py) - no need to map idx to dataset
     val_iterator = None
-    if training_config.early_stopping and training_config.should_eval_validation:
+    if training_config.should_eval_validation:
         try:
-            # Use validation batches for early stopping (they have all_choices_ids for accuracy computation)
+            # Use validation batches for evaluation (they have all_choices_ids for accuracy computation)
             val_iterator = batcher.get_evalBatches("validation", training_config.eval_template_idx)
-            print(f"✓ Validation iterator created for early stopping (using validation set for accuracy-based early stopping)")
+            if training_config.early_stopping:
+                print(f"✓ Validation iterator created for early stopping")
+                print(f"  - Using validation set (first 32 samples) for accuracy-based early stopping")
+                print(f"  - Checkpoint frequency: every {training_config.checkpoint_frequency} batches")
+                print(f"  - Patience: {training_config.early_stopping_num_checkpoints_without_improvement} checkpoints without improvement")
+                print(f"  - Using 'lbl' field from batches for correct answers (same as Scorer)")
+            else:
+                print(f"✓ Validation iterator created for monitoring (early stopping disabled)")
+                print(f"  - Using validation set (first 32 samples) for accuracy monitoring")
+                print(f"  - Checkpoint frequency: every {training_config.checkpoint_frequency} batches")
+                print(f"  - Using 'lbl' field from batches for correct answers (same as Scorer)")
         except Exception as e:
             print(f"⚠ Warning: Could not create validation iterator: {e}")
-            print(f"  Early stopping will be disabled")
-            training_config.early_stopping = False
+            if training_config.early_stopping:
+                print(f"  Early stopping will be disabled")
+                training_config.early_stopping = False
     
     for batch_idx in tqdm(range(training_config.num_batches), desc="Training"):
         train_batch = next(train_iterator)
@@ -1189,23 +1225,30 @@ def train_t5_axis(
             optimizer.step()
         
         if is_nodeZero(device) and (batch_idx + 1) % 100 == 0:
-            print(f"  Batch {batch_idx + 1}/{training_config.num_batches}, Loss: {metrics['loss']:.4f}")
+            current_training_loss = metrics['loss']
+            print(f"  Batch {batch_idx + 1}/{training_config.num_batches}, Training Loss: {current_training_loss:.4f}")
         
-        # Early stopping evaluation at checkpoint frequency
-        if (training_config.early_stopping and 
-            training_config.should_eval_validation and 
+        # Validation evaluation at checkpoint frequency (even if early stopping is disabled, we still show metrics)
+        if (training_config.should_eval_validation and 
             val_iterator is not None and
             (batch_idx + 1) % training_config.checkpoint_frequency == 0):
+            
+            if training_config.early_stopping:
+                print(f"\n  [Early Stopping Checkpoint] Evaluating on validation set at batch {batch_idx + 1}...")
+            else:
+                print(f"\n  [Validation Checkpoint] Evaluating on validation set at batch {batch_idx + 1}...")
             
             # Evaluate on validation set using accuracy (validation batches have all_choices_ids for multiple choice)
             model.eval()
             val_correct = 0
             val_total = 0
+            val_batches_processed = 0
             with torch.no_grad():
                 # Evaluate on a few validation batches (limit to avoid long evaluation)
                 for val_batch_idx, val_batch in enumerate(val_iterator):
                     if val_batch_idx >= 10:  # Limit to 10 validation batches for speed
                         break
+                    val_batches_processed += 1
                     
                     # Check if batch has required fields for multiple choice evaluation
                     required_fields = ['input_ids', 'input_mask', 'all_choices_ids', 'all_choices_mask', 'idx']
@@ -1241,35 +1284,34 @@ def train_t5_axis(
                                 length_normalization=getattr(training_config, 'length_normalization', False)
                             )
                         
-                        # Get correct answers from dataset_reader using idx
-                        # Handle both tensor and list types for idx
-                        idx_data = val_batch_on_device['idx']
-                        if isinstance(idx_data, torch.Tensor):
-                            batch_indices = idx_data.cpu().numpy()
-                        elif isinstance(idx_data, list):
-                            # Convert list to numpy array directly
-                            batch_indices = np.array(idx_data)
+                        # Get correct answers from batch - use 'lbl' field (same as Scorer in evaluate.py)
+                        # 'lbl' is the correct choice index (0, 1, 2, ...) and is already in the batch
+                        # This is the same approach used in src/eval/Scorer.py: references=batchOf_evalInfo["lbl"]
+                        if 'lbl' in val_batch_on_device:
+                            correct_choices = val_batch_on_device['lbl']
+                            # Handle both tensor and list types
+                            if isinstance(correct_choices, torch.Tensor):
+                                correct_choices = correct_choices.cpu().numpy()
+                            elif isinstance(correct_choices, list):
+                                correct_choices = np.array(correct_choices)
+                            
+                            # Compare predicted_choice with correct_choices
+                            # predicted_choice is already a numpy array or list from predict_mulChoice
+                            if isinstance(predicted_choice, torch.Tensor):
+                                predicted_choice = predicted_choice.cpu().numpy()
+                            elif not isinstance(predicted_choice, np.ndarray):
+                                predicted_choice = np.array(predicted_choice)
+                            
+                            # Ensure same length
+                            batch_size = min(len(predicted_choice), len(correct_choices))
+                            for i in range(batch_size):
+                                if predicted_choice[i] == correct_choices[i]:
+                                    val_correct += 1
+                                val_total += 1
                         else:
-                            # Fallback: try to convert to numpy array
-                            batch_indices = np.array([idx_data])
-                        for i, idx in enumerate(batch_indices):
-                            # Get the datapoint from dataset_reader to find correct answer
-                            dataset = dataset_reader.get_dataset("validation", training_config.eval_template_idx, is_evaluation=True)
-                            if idx < len(dataset):
-                                datapoint = dataset[idx]
-                                # Find correct choice index
-                                # For multiple choice, we need to find which choice matches the target
-                                if 'answer_choices' in datapoint and 'target' in datapoint:
-                                    target_text = datapoint['target']
-                                    answer_choices = datapoint['answer_choices']
-                                    try:
-                                        correct_choice_idx = answer_choices.index(target_text)
-                                        if predicted_choice[i] == correct_choice_idx:
-                                            val_correct += 1
-                                        val_total += 1
-                                    except (ValueError, IndexError):
-                                        # Skip if target not in choices or index out of range
-                                        continue
+                            # Fallback: if 'lbl' is missing, print warning (should not happen)
+                            if val_batch_idx == 0:
+                                print(f"    ⚠ Warning: 'lbl' field not found in validation batch. Available keys: {list(val_batch_on_device.keys())}")
                     except Exception as e:
                         # Skip this batch if there's an error
                         print(f"    ⚠ Warning: Skipping validation batch {val_batch_idx} due to error: {e}")
@@ -1278,29 +1320,67 @@ def train_t5_axis(
                             traceback.print_exc()
                         continue
             
+            # Always print validation results, even if val_total is 0
             if val_total > 0:
                 val_accuracy = val_correct / val_total
-                print(f"\n  Checkpoint at batch {batch_idx + 1}: Validation accuracy = {val_accuracy:.4f} ({val_correct}/{val_total})")
                 
                 # Check if this is the best validation accuracy
                 if val_accuracy > best_val_accuracy:
                     best_val_accuracy = val_accuracy
                     num_checkpoints_since_best = 0
-                    print(f"    ✓ New best validation accuracy: {best_val_accuracy:.4f}")
+                    improvement_status = "✓ NEW BEST"
                 else:
                     num_checkpoints_since_best += 1
-                    print(f"    No improvement ({num_checkpoints_since_best}/{training_config.early_stopping_num_checkpoints_without_improvement})")
+                    improvement_status = "no improvement"
                 
-                # Check early stopping condition
-                if num_checkpoints_since_best >= training_config.early_stopping_num_checkpoints_without_improvement:
-                    print(f"\n{'='*80}")
-                    print(f"EARLY STOPPING TRIGGERED!")
-                    print(f"  Patience threshold ({training_config.early_stopping_num_checkpoints_without_improvement} checkpoints) reached.")
-                    print(f"  Best validation accuracy: {best_val_accuracy:.4f}")
-                    print(f"  Batches seen: {batches_seen}/{training_config.num_batches}")
-                    print(f"{'='*80}\n")
-                    early_stopping_triggered = True
-                    break
+                # Always show: current accuracy, best accuracy, patience counter
+                training_loss_str = f"{current_training_loss:.4f}" if current_training_loss is not None else "N/A"
+                log_line = (f"  Training Loss: {training_loss_str} | "
+                           f"Validation accuracy = {val_accuracy:.4f} ({val_correct}/{val_total} samples) | "
+                           f"Best: {best_val_accuracy:.4f} | "
+                           f"Patience: {num_checkpoints_since_best}/{training_config.early_stopping_num_checkpoints_without_improvement} ({improvement_status})")
+                print(log_line)
+                
+                # Write to training log file (flush immediately)
+                with open(training_log_path, 'a') as f:
+                    f.write(f"Batch {batch_idx + 1:6d} | {training_loss_str:>8} | {val_accuracy:.4f} | {best_val_accuracy:.4f} | "
+                           f"{num_checkpoints_since_best}/{training_config.early_stopping_num_checkpoints_without_improvement} | "
+                           f"{improvement_status}\n")
+                    f.flush()  # Force write to disk
+                
+                # Check early stopping condition (only if early stopping is enabled)
+                if training_config.early_stopping:
+                    if num_checkpoints_since_best >= training_config.early_stopping_num_checkpoints_without_improvement:
+                        print(f"\n{'='*80}")
+                        print(f"EARLY STOPPING TRIGGERED!")
+                        print(f"  Patience threshold ({training_config.early_stopping_num_checkpoints_without_improvement} checkpoints) reached.")
+                        print(f"  Best validation accuracy: {best_val_accuracy:.4f}")
+                        print(f"  Batches seen: {batches_seen}/{training_config.num_batches}")
+                        print(f"{'='*80}\n")
+                        
+                        # Write early stopping to log file
+                        with open(training_log_path, 'a') as f:
+                            f.write("\n" + "=" * 80 + "\n")
+                            f.write("EARLY STOPPING TRIGGERED!\n")
+                            f.write(f"Patience threshold ({training_config.early_stopping_num_checkpoints_without_improvement} checkpoints) reached.\n")
+                            f.write(f"Best validation accuracy: {best_val_accuracy:.4f}\n")
+                            f.write(f"Batches seen: {batches_seen}/{training_config.num_batches}\n")
+                            f.write("=" * 80 + "\n")
+                            f.flush()
+                        
+                        early_stopping_triggered = True
+                        break
+            else:
+                # No validation samples processed - print warning
+                training_loss_str = f"{current_training_loss:.4f}" if current_training_loss is not None else "N/A"
+                print(f"  ⚠ Warning: No validation samples processed (val_total=0). Check validation data loading.")
+                print(f"    Processed {val_batches_processed} validation batches, but no valid samples found.")
+                print(f"    Training Loss: {training_loss_str}")
+                
+                # Write warning to log file
+                with open(training_log_path, 'a') as f:
+                    f.write(f"Batch {batch_idx + 1:6d} | {training_loss_str:>8} | ERROR: No validation samples (val_total=0, batches={val_batches_processed})\n")
+                    f.flush()  # Force write to disk
             
             model.train()
             # Reset validation iterator for next checkpoint
@@ -1311,6 +1391,13 @@ def train_t5_axis(
         print("STEP 8: Training Stopped Early - Evaluating on Test Set")
     else:
         print("STEP 8: Training Completed - Evaluating on Test Set")
+        # Write completion to log file
+        with open(training_log_path, 'a') as f:
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("TRAINING COMPLETED (no early stopping)\n")
+            f.write(f"Total batches: {batches_seen}/{training_config.num_batches}\n")
+            f.write(f"Best validation accuracy: {best_val_accuracy:.4f}\n")
+            f.write("=" * 80 + "\n")
     print("=" * 80)
     
     # Evaluation on test set
@@ -1551,10 +1638,18 @@ def main(args):
     """
     Main function for T5 AXIS training (single GPU, no DDP).
     
-    Iterates over:
-    1. Number of source datasets (from resume_from_idx to end_index)
-    2. For each number of source datasets, iterates over all possible target datasets
-       (target must be different from source datasets)
+    Two workflows supported:
+    
+    1. OLD WORKFLOW (backward compatible, when --target is not specified):
+       - Iterates over number of source datasets (from resume_from_idx to end_index)
+       - For each number of source datasets, iterates over all possible target datasets
+       - Target must be different from source datasets
+    
+    2. NEW WORKFLOW (when --target is specified):
+       - Outer loop: iterates over all target datasets (or single target if --target specified)
+       - Inner loop: for each target, generates all combinations of source datasets
+       - Source datasets cannot include the target dataset
+       - Iterates over all combinations from min_sources to max_sources
     
     Args:
         args: parsed arguments
@@ -1564,6 +1659,7 @@ def main(args):
     import random
     import pandas as pd
     from datetime import datetime
+    from itertools import combinations
     
     # Set seed
     if args.seed is not None:
@@ -1580,8 +1676,19 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"All datasets: {all_datasets}")
-    print(f"Resume from idx: {args.resume_from_idx}, End index: {args.end_index}")
-    print("=" * 100)
+    
+    # Determine workflow mode
+    use_new_workflow = args.target is not None
+    
+    if use_new_workflow:
+        print("=" * 100)
+        print("NEW WORKFLOW: Outer loop over targets, inner loop over all source combinations")
+        print("=" * 100)
+        print(f"Target dataset: {args.target}")
+        print(f"Source combinations: from {args.min_sources} to {args.max_sources} sources")
+    else:
+        print(f"OLD WORKFLOW: Resume from idx: {args.resume_from_idx}, End index: {args.end_index}")
+        print("=" * 100)
     
     # Load config
     with open(args.config, 'r') as f:
@@ -1591,9 +1698,10 @@ def main(args):
     csv_dir = "exp_out/t5_axis/with_early_stopping"
     os.makedirs(csv_dir, exist_ok=True)
     
-    # Generate CSV filename with timestamp
+    # Generate CSV filename with timestamp and SLURM job_id
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"t5_axis_results_{timestamp_str}.csv"
+    slurm_job_id = os.environ.get('SLURM_JOB_ID', 'no_job_id')
+    csv_filename = f"t5_axis_results_{timestamp_str}_job{slurm_job_id}.csv"
     csv_path = os.path.join(csv_dir, csv_filename)
     
     # Get reverse flag from args (default False)
@@ -1613,6 +1721,129 @@ def main(args):
     else:
         print(f"✓ Appending to existing CSV file: {csv_path}")
     
+    # NEW WORKFLOW: Outer loop over targets, inner loop over all source combinations
+    if use_new_workflow:
+        # Determine target datasets to iterate over
+        if args.target in all_datasets:
+            target_datasets = [args.target]
+        else:
+            print(f"⚠ Warning: Target '{args.target}' not in all_datasets. Using all datasets as targets.")
+            target_datasets = all_datasets
+        
+        # Outer loop: iterate over target datasets
+        for target_dataset_name in target_datasets:
+            print("\n" + "=" * 100)
+            print(f"TARGET DATASET: {target_dataset_name}")
+            print("=" * 100)
+            
+            # Get available source datasets (all except target)
+            available_sources = [d for d in all_datasets if d != target_dataset_name]
+            print(f"Available source datasets: {available_sources} ({len(available_sources)} datasets)")
+            
+            # Inner loop: iterate over number of source datasets (from min_sources to max_sources)
+            for k in range(args.min_sources, args.max_sources + 1):
+                if k > len(available_sources):
+                    print(f"\nSkipping k={k} (only {len(available_sources)} available sources)")
+                    continue
+                
+                # Generate all combinations of k source datasets
+                source_combinations = list(combinations(available_sources, k))
+                print(f"\n  k={k}: {len(source_combinations)} combinations")
+                
+                # Iterate over each combination
+                for source_datasets_tuple in source_combinations:
+                    source_datasets = list(source_datasets_tuple)
+                    
+                    print(f"\n  - Source: {source_datasets} → Target: {target_dataset_name}")
+                    
+                    try:
+                        # Train
+                        results = train_t5_axis(
+                            source_datasets=source_datasets,
+                            target_dataset_name=target_dataset_name,
+                            base_checkpoint=args.model,
+                            save_dir="exp_out/t5_finetuning/t5-base",
+                            config_filepath=args.config,
+                            svd_threshold=args.svd_threshold,
+                            seed=args.seed,
+                            device=device,
+                            world_size=1,
+                            rank=0,
+                        )
+                        
+                        # Extract accuracy from scores
+                        scores = results.get("scores", {})
+                        accuracy = None
+                        
+                        # Try to find accuracy in scores (format may vary)
+                        if isinstance(scores, dict):
+                            # Common keys for accuracy
+                            for key in ["accuracy", "acc", "exact_match", "em", "f1"]:
+                                if key in scores:
+                                    accuracy = scores[key]
+                                    break
+                            # If no direct key, try nested dicts
+                            if accuracy is None:
+                                for key, value in scores.items():
+                                    if isinstance(value, dict):
+                                        for subkey in ["accuracy", "acc", "exact_match", "em", "f1"]:
+                                            if subkey in value:
+                                                accuracy = value[subkey]
+                                                break
+                                        if accuracy is not None:
+                                            break
+                        
+                        # Format source datasets string
+                        source_str = " | ".join(source_datasets)
+                        
+                        # Store result for CSV
+                        result_row = {
+                            "source_datasets": source_str,
+                            "target_dataset": target_dataset_name,
+                            "svd_threshold": args.svd_threshold,
+                            "seed": args.seed,
+                            "accuracy": accuracy if accuracy is not None else None,
+                            "scores": json.dumps(scores) if scores else None,
+                            "experiment_dir": results.get("experiment_dir", ""),
+                            "timestamp": results.get("timestamp", datetime.now().isoformat()),
+                            "batches_seen": results.get("batches_seen", None),
+                            "early_stopping_triggered": results.get("early_stopping_triggered", False),
+                            "reverse": reverse_flag,
+                        }
+                        
+                        # Append result to CSV immediately after each test
+                        df_row = pd.DataFrame([result_row])
+                        df_row.to_csv(csv_path, mode='a', header=False, index=False)
+                        print(f"    ✓ Result appended to CSV")
+                        
+                        # Print evaluation result
+                        if accuracy is not None:
+                            print(f"    RESULT: train sources task [{source_str}] for target task [{target_dataset_name}] acc: {accuracy:.4f}")
+                        else:
+                            print(f"    RESULT: train sources task [{source_str}] for target task [{target_dataset_name}]")
+                            print(f"    Scores: {scores}")
+                        
+                        print(f"    ✓ Successfully completed: source={source_datasets}, target={target_dataset_name}")
+                        
+                    except Exception as e:
+                        print(f"\n    ✗ ERROR: source={source_datasets}, target={target_dataset_name} failed with error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        print("\n    " + "=" * 100)
+                        print("    FATAL ERROR: Stopping entire job due to error!")
+                        print("    " + "=" * 100)
+                        import sys
+                        sys.exit(1)
+            
+            print(f"\n✓ Completed all source combinations for target: {target_dataset_name}")
+        
+        # Final summary
+        print("\n" + "=" * 100)
+        print(f"✓ All experiments completed. Results saved to CSV: {csv_path}")
+        print("=" * 100)
+        return
+    
+    # OLD WORKFLOW: Backward compatible (original implementation)
     # Iterate over number of source datasets
     for source_idx in range(len(all_datasets)):
         if source_idx < args.resume_from_idx:
@@ -1743,10 +1974,14 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--config", type=str, default="axis/configs/t5_axis_training.json", help="Config file path")
     parser.add_argument("--reverse", action="store_true", default=False, help="Reverse flag (True when running run_t5_axis_rev.sh)")
+    parser.add_argument("--target", type=str, default=None, help="Target dataset name (if specified, uses new workflow: outer loop over targets, inner loop over all source combinations)")
+    parser.add_argument("--min-sources", type=int, default=1, help="Minimum number of source datasets (for new workflow, default: 1)")
+    parser.add_argument("--max-sources", type=int, default=6, help="Maximum number of source datasets (for new workflow, default: 6)")
     
     args = parser.parse_args()
     
     # Single GPU training (no DDP)
-    # Note: target-dataset-name is no longer needed - all targets are iterated automatically
+    # If --target is specified, uses new workflow (outer loop over targets, all combinations)
+    # Otherwise, uses old workflow (backward compatible)
     main(args)
 

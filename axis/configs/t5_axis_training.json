@@ -5,7 +5,7 @@
     "gradient_accumulation_factor": 1,
     "train_template_idx": 0,
     "eval_template_idx": 0,
-    "num_batches": 50000,
+    "num_batches": 4000,
     "optimizer": "adamw",
     "scheduler": null,
     "lr": 8e-5,
@@ -21,7 +21,7 @@
     "use_bfloat16_during_training": true,
     "use_bfloat16_during_eval": true,
     "early_stopping": true,
-    "early_stopping_num_checkpoints_without_improvement": 5,
+    "early_stopping_num_checkpoints_without_improvement": 3,
     "should_eval_validation": true
 }
 

@@ -55,6 +55,149 @@ python ./src/inference.py -c configs/t5_large.json -i ${dataset} --kwargs checkp
 ```
 
 
+## AXIS Training for T5 Models
+
+### Overview
+
+AXIS (Adaptive eXperimental Integration of Singular values) is a method for merging task vectors using Singular Value Decomposition (SVD) and learning optimal singular values. This implementation is specifically designed for T5-base models.
+
+### How It Works
+
+The AXIS training process consists of the following steps:
+
+1. **Task Vector Loading**: Load task vectors for source datasets (fine-tuned models minus base model)
+2. **iso_c Merging**: Apply SVD-based merging to combine task vectors:
+   - For 2D layers: Extract SVD components (U, S, Vh) and select top components based on `svd_threshold`
+   - For non-2D layers: Average task vectors directly
+3. **Model Creation**: Create a merged model with learnable singular values:
+   - Base T5 model parameters are frozen
+   - Only selected singular values (top components) are learnable
+   - Remaining components are frozen
+4. **Training**: Train learnable singular values on target dataset:
+   - Uses AdamW optimizer with learning rate 8e-5
+   - Mixed precision training (bfloat16)
+   - Validation monitoring every 100 batches (configurable)
+   - Early stopping can be enabled (currently disabled by default)
+5. **Evaluation**: Evaluate merged model on target dataset test set
+
+### Main Components
+
+- **`axis/t5_task_vectors.py`**: `T5TaskVector` class for loading and normalizing T5 checkpoints
+- **`axis/t5_axis_merging.py`**: Main training module with:
+  - `iso_c_t5()`: SVD-based merging function
+  - `LearnableSingularValuesMergedT5Wrapper`: Model wrapper with learnable singular values
+  - `train_t5_axis()`: Training loop
+  - `main()`: Entry point with dataset iteration logic
+
+### Configuration
+
+Training configuration is in `axis/configs/t5_axis_training.json`:
+
+```json
+{
+    "pretrained_model": "t5-base",
+    "train_batch_size": 600,
+    "eval_batch_size": 600,
+    "num_batches": 2000,
+    "lr": 8e-5,
+    "checkpoint_frequency": 100,
+    "early_stopping": false,
+    "should_eval_validation": true,
+    ...
+}
+```
+
+### Running Training
+
+#### Using SLURM Script
+
+```bash
+sbatch axis/run_t5_axis.sh
+```
+
+The script (`axis/run_t5_axis.sh`) handles:
+- Environment setup
+- Iteration over source dataset combinations
+- Multiple SVD thresholds and seeds
+
+#### Direct Python Execution
+
+```bash
+python -m axis.t5_axis_merging \
+    --svd-threshold=0.1 \
+    --model=t5-base \
+    --resume-from-idx=0 \
+    --end-index=1 \
+    --seed=42 \
+    --config=axis/configs/t5_axis_training.json
+```
+
+**Arguments:**
+- `--svd-threshold`: Threshold for SVD component selection (0.0-1.0, default: 0.1)
+- `--model`: Base model name (default: t5-base)
+- `--resume-from-idx`: Start from this number of source datasets (0 = 1 source)
+- `--end-index`: End at this number of source datasets (exclusive)
+- `--seed`: Random seed for reproducibility
+- `--config`: Path to training configuration JSON
+- `--reverse`: (Optional) Reverse dataset order
+
+**Example:**
+- `resume-from-idx=0, end-index=1`: Train with 1 source dataset (paws), test on all other datasets
+- `resume-from-idx=0, end-index=2`: Train with 1 source (paws), then 2 sources (paws, qasc), test on remaining
+
+### Dataset Order
+
+The datasets are processed in this order:
+```
+["paws", "qasc", "quartz", "story_cloze", "wiki_qa", "winogrande", "wsc"]
+```
+
+### Training Process
+
+1. **Source Dataset Selection**: For each number of source datasets (from `resume-from-idx` to `end-index`):
+   - Select source datasets sequentially (e.g., [paws], then [paws, qasc], etc.)
+   
+2. **Target Dataset Iteration**: For each source combination:
+   - Train on all remaining datasets as targets
+   - Each target gets a separate training run
+
+3. **Training Steps**:
+   - Load base model (t5-base)
+   - Load task vectors for source datasets
+   - Compute iso_c merging with SVD
+   - Create model with learnable singular values
+   - Train for `num_batches` batches (default: 2000)
+   - Evaluate on target test set
+   - Save results to CSV
+
+### Output Files
+
+Results are saved in `exp_out/t5_axis/with_early_stopping/`:
+
+- **CSV file**: `t5_axis_results_{timestamp}_job{slurm_job_id}.csv`
+  - Contains: source_datasets, target_dataset, svd_threshold, seed, accuracy, batches_seen, early_stopping_triggered, reverse
+  
+- **Experiment directory**: `exp_out/t5_axis/t5-axis-{target}-{N}sources-svd{threshold}-seed{seed}/`
+  - `results.json`: Full evaluation results
+  - `singular_values.json`: Learned singular values
+  - `training_log.txt`: Training log (validation accuracy tracking)
+
+### Training Configuration Details
+
+- **Batch Size**: 600 (train and eval)
+- **Learning Rate**: 8e-5
+- **Optimizer**: AdamW
+- **Precision**: bfloat16 (mixed precision)
+- **Validation**: Monitored every 100 batches (even if early stopping is disabled)
+- **Early Stopping**: Currently disabled by default (can be enabled in config)
+
+### Notes
+
+- Training uses single GPU (no DDP)
+- Task vectors are loaded from `exp_out/t5_finetuning/t5-base/`
+- Validation uses first 32 samples from validation split
+- Test evaluation uses full test split (after removing first 32 samples for validation)
+
 ## Merging Models
 
 ### T5-Large

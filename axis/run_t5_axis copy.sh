@@ -70,7 +70,7 @@ if [ "$WORKFLOW_MODE" = "new" ]; then
     MAX_SOURCES=6  # Maximum number of source datasets
     
     # SVD thresholds to test
-    SVD_THRESHOLDS=(0.1) # 0.2 0.4 0.6 0.8 1.0
+    SVD_THRESHOLDS=(0.1 0.2 0.4 0.6 0.8 1.0)
     SEEDs=(42)
     
     for SEED in "${SEEDs[@]}"; do
