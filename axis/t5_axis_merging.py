@@ -662,6 +662,7 @@ def train_t5_axis(
     device,
     world_size=None,
     rank=None,
+    job_log_file=None,  # Optional: job-specific log file for appending training logs
 ):
     """
     Train T5 model with AXIS method.
@@ -706,12 +707,33 @@ def train_t5_axis(
     with open(config_filepath, 'r') as f:
         config_dict = json.load(f)
     
-    # Create experiment directory
-    experiment_name = f"t5-axis-{target_dataset_name}-{len(source_datasets)}sources-svd{svd_threshold}-seed{seed}"
-    experiment_dir = os.path.join("exp_out", "t5_axis", experiment_name)
-    os.makedirs(experiment_dir, exist_ok=True)
+    # No longer creating separate experiment directories - all info goes to job log file
+    # experiment_dir is kept as None for backward compatibility
+    experiment_dir = None  # No longer creating separate folders
     
-    config_dict['experiment_dir'] = experiment_dir
+    # Use job_log_file if provided, otherwise create a temporary log path (for training_log.txt)
+    if job_log_file:
+        # Use job log directory for training log
+        job_log_dir = os.path.dirname(job_log_file)
+        training_log_path = os.path.join(job_log_dir, "training_log.txt")
+    else:
+        # Fallback: create temporary directory (should not happen in normal workflow)
+        temp_dir = os.path.join("exp_out", "t5_axis", "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        training_log_path = os.path.join(temp_dir, f"training_log_{target_dataset_name}_{seed}.txt")
+    
+    # Don't set experiment_dir - let TrainingConfig use default None
+    # (We're not creating separate experiment directories anymore - all info goes to job log file)
+    # Remove experiment_dir from config_dict if present to avoid ast.literal_eval errors with empty string
+    # Empty string "" causes SyntaxError in ast.literal_eval("") in Config._update_fromDict
+    if 'experiment_dir' in config_dict:
+        # If it's an empty string, remove it (causes ast.literal_eval error)
+        if config_dict['experiment_dir'] == "":
+            config_dict.pop('experiment_dir')
+        # If it's None or a valid path, we can leave it (but we don't need it)
+        # Actually, let's remove it anyway since we're not using separate experiment dirs
+        elif config_dict.get('experiment_dir') is not None:
+            config_dict.pop('experiment_dir')
     config_dict['seed'] = seed
     # Enable early stopping (can be configured in JSON config)
     # config_dict['early_stopping'] is read from JSON config
@@ -993,7 +1015,9 @@ def train_t5_axis(
     print(f"    train_samples: {train_samples:,} samples" if train_samples is not None else "    train_samples: N/A")
     print(f"    test_samples: {test_samples:,} samples" if test_samples is not None else "    test_samples: N/A")
     print(f"\n  Experiment:")
-    print(f"    experiment_dir: {experiment_dir}")
+    print(f"    experiment_dir: (not used - all info in job log file)")
+    if job_log_file:
+        print(f"    job_log_file: {job_log_file}")
     print("=" * 80)
     
     # Training loop with early stopping support
@@ -1013,23 +1037,67 @@ def train_t5_axis(
     early_stopping_triggered = False
     current_training_loss = None  # Track current training loss for logging
     
-    # Create training log file for validation accuracy tracking
-    training_log_path = os.path.join(experiment_dir, "training_log.txt")
-    with open(training_log_path, 'w') as f:
-        f.write("Training Log - Validation Accuracy Tracking\n")
-        f.write("=" * 80 + "\n")
-        f.write(f"Source datasets: {source_datasets}\n")
-        f.write(f"Target dataset: {target_dataset_name}\n")
-        f.write(f"SVD threshold: {svd_threshold}\n")
-        f.write(f"Seed: {seed}\n")
-        if training_config.early_stopping:
-            f.write(f"Early stopping: enabled (patience={training_config.early_stopping_num_checkpoints_without_improvement})\n")
-        else:
-            f.write(f"Early stopping: disabled (validation monitoring only)\n")
-        f.write("=" * 80 + "\n")
-        f.write("Format: Batch | Training Loss | Current Accuracy | Best Accuracy | Patience Counter | Status\n")
-        f.write("-" * 80 + "\n")
-    print(f"✓ Training log file created: {training_log_path}")
+    # Append training log header to job log file (instead of separate training_log.txt)
+    if job_log_file:
+        try:
+            with open(job_log_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n{'='*80}\n")
+                f.write("TRAINING LOG - Validation Accuracy Tracking\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Source datasets: {source_datasets}\n")
+                f.write(f"Target dataset: {target_dataset_name}\n")
+                f.write(f"SVD threshold: {svd_threshold}\n")
+                f.write(f"Seed: {seed}\n")
+                if training_config.early_stopping:
+                    f.write(f"Early stopping: enabled (patience={training_config.early_stopping_num_checkpoints_without_improvement})\n")
+                else:
+                    f.write(f"Early stopping: disabled (validation monitoring only)\n")
+                f.write("=" * 80 + "\n")
+                f.write("Format: Batch | Training Loss | Current Accuracy | Best Accuracy | Patience Counter | Status\n")
+                f.write("-" * 80 + "\n")
+                f.flush()
+            print(f"✓ Training log header appended to job log: {job_log_file}")
+            training_log_path = job_log_file  # Use job log file for training logs
+        except Exception as e:
+            print(f"⚠ Warning: Could not append training log header to job log file: {e}")
+            # Fallback: use separate file
+            job_log_dir = os.path.dirname(job_log_file) if job_log_file else "exp_out/t5_axis/temp"
+            training_log_path = os.path.join(job_log_dir, "training_log.txt")
+            os.makedirs(os.path.dirname(training_log_path), exist_ok=True)
+            with open(training_log_path, 'w') as f:
+                f.write("Training Log - Validation Accuracy Tracking\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Source datasets: {source_datasets}\n")
+                f.write(f"Target dataset: {target_dataset_name}\n")
+                f.write(f"SVD threshold: {svd_threshold}\n")
+                f.write(f"Seed: {seed}\n")
+                if training_config.early_stopping:
+                    f.write(f"Early stopping: enabled (patience={training_config.early_stopping_num_checkpoints_without_improvement})\n")
+                else:
+                    f.write(f"Early stopping: disabled (validation monitoring only)\n")
+                f.write("=" * 80 + "\n")
+                f.write("Format: Batch | Training Loss | Current Accuracy | Best Accuracy | Patience Counter | Status\n")
+                f.write("-" * 80 + "\n")
+    else:
+        # Fallback: create separate training log file
+        temp_dir = os.path.join("exp_out", "t5_axis", "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        training_log_path = os.path.join(temp_dir, f"training_log_{target_dataset_name}_{seed}.txt")
+        with open(training_log_path, 'w') as f:
+            f.write("Training Log - Validation Accuracy Tracking\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Source datasets: {source_datasets}\n")
+            f.write(f"Target dataset: {target_dataset_name}\n")
+            f.write(f"SVD threshold: {svd_threshold}\n")
+            f.write(f"Seed: {seed}\n")
+            if training_config.early_stopping:
+                f.write(f"Early stopping: enabled (patience={training_config.early_stopping_num_checkpoints_without_improvement})\n")
+            else:
+                f.write(f"Early stopping: disabled (validation monitoring only)\n")
+            f.write("=" * 80 + "\n")
+            f.write("Format: Batch | Training Loss | Current Accuracy | Best Accuracy | Patience Counter | Status\n")
+            f.write("-" * 80 + "\n")
+        print(f"✓ Training log file created: {training_log_path}")
     
     # Create EvalWrapper for early stopping (needed for predict_mulChoice)
     # We define it here so it can be used in early stopping evaluation
@@ -1244,10 +1312,8 @@ def train_t5_axis(
             val_total = 0
             val_batches_processed = 0
             with torch.no_grad():
-                # Evaluate on a few validation batches (limit to avoid long evaluation)
+                # Evaluate on all validation batches (validation set should be limited to num_val_samples=32)
                 for val_batch_idx, val_batch in enumerate(val_iterator):
-                    if val_batch_idx >= 10:  # Limit to 10 validation batches for speed
-                        break
                     val_batches_processed += 1
                     
                     # Check if batch has required fields for multiple choice evaluation
@@ -1402,10 +1468,19 @@ def train_t5_axis(
     
     # Evaluation on test set
     model.eval()
+    # Use job_log_dir for predictions if available, otherwise use temp directory
+    if job_log_file:
+        job_log_dir = os.path.dirname(job_log_file)
+        prediction_dir = os.path.join(job_log_dir, "predictions")
+    else:
+        # Fallback: use temp directory
+        temp_dir = os.path.join("exp_out", "t5_axis", "temp")
+        prediction_dir = os.path.join(temp_dir, "predictions")
+    
     evaluation_config = EvaluationConfig(
         configDict_toInitializeFrom=training_config.get_dict(),
         fields_toUpdate={
-            "prediction_dir": os.path.join(experiment_dir, "predictions"),
+            "prediction_dir": prediction_dir,
             "inference_dataset": target_dataset_name,
             "split": "test",
         }
@@ -1563,14 +1638,90 @@ def train_t5_axis(
     
     eval_model = EvalWrapper(model, tokenizer)
     
-    # Evaluate
-    scores, cached_datasetReaders = evaluate_fromConfig(
-        eval_model,
-        tokenizer,
-        cached_datasetReaders={target_dataset_name: dataset_reader},
-        evaluation_config=evaluation_config,
-        device=device
-    )
+    # Generate unique experiment_id to avoid cache collisions between parallel SLURM jobs
+    # Format: source_datasets__target_dataset__svd_threshold__seed__job_id
+    import os
+    slurm_job_id = os.environ.get('SLURM_JOB_ID', 'local')
+    sorted_sources = sorted(source_datasets)
+    source_str = "_".join(sorted_sources)
+    experiment_id = f"{source_str}__{target_dataset_name}__{svd_threshold}__{seed}__{slurm_job_id}"
+    # Sanitize experiment_id (remove special characters that might cause issues)
+    experiment_id = experiment_id.replace(" ", "_").replace("|", "_").replace("/", "_")
+    
+    # Evaluate with retry mechanism for Arrow file errors (NFS issues)
+    max_eval_retries = 3
+    eval_retry_delay = 2.0  # seconds
+    scores = None
+    cached_datasetReaders = None
+    
+    for eval_attempt in range(max_eval_retries):
+        try:
+            scores, cached_datasetReaders = evaluate_fromConfig(
+                eval_model,
+                tokenizer,
+                cached_datasetReaders={target_dataset_name: dataset_reader},
+                evaluation_config=evaluation_config,
+                device=device,
+                experiment_id=experiment_id  # Pass unique experiment_id to avoid cache collisions
+            )
+            # Success - break out of retry loop
+            break
+        except Exception as e:
+            error_str = str(e)
+            is_arrow_error = (
+                "ArrowInvalid" in error_str or 
+                "Tried reading schema message" in error_str or
+                "Stale file handle" in error_str or
+                "arrow" in error_str.lower()
+            )
+            # Check for cache collision error (should not happen with experiment_id, but handle it anyway)
+            is_cache_collision_error = (
+                "another evaluation module instance is already using the local cache file" in error_str or
+                "Please specify an experiment_id" in error_str
+            )
+            
+            if (is_arrow_error or is_cache_collision_error) and eval_attempt < max_eval_retries - 1:
+                if is_cache_collision_error:
+                    print(f"\n⚠ Warning: Cache collision error during evaluation (attempt {eval_attempt + 1}/{max_eval_retries}): {e}")
+                    print(f"  This should not happen with experiment_id={experiment_id}. Retrying in {eval_retry_delay} seconds...")
+                else:
+                    print(f"\n⚠ Warning: Arrow file error during evaluation (attempt {eval_attempt + 1}/{max_eval_retries}): {e}")
+                    print(f"  This is likely due to NFS issues. Retrying in {eval_retry_delay} seconds...")
+                
+                # Try to clean up potentially corrupted Arrow files in evaluate cache
+                try:
+                    import os
+                    import glob
+                    import shutil
+                    # HuggingFace evaluate cache is typically in ~/.cache/huggingface/evaluate/
+                    # or in HF_HOME if set
+                    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+                    evaluate_cache = os.path.join(hf_home, "evaluate")
+                    if os.path.exists(evaluate_cache):
+                        # Find and remove potentially corrupted Arrow files
+                        arrow_files = glob.glob(os.path.join(evaluate_cache, "**", "*.arrow"), recursive=True)
+                        if arrow_files:
+                            print(f"  Found {len(arrow_files)} Arrow files in cache. Cleaning up...")
+                            # Remove files that might be corrupted (very small or very old)
+                            for arrow_file in arrow_files:
+                                try:
+                                    file_size = os.path.getsize(arrow_file)
+                                    # Remove files smaller than 100 bytes (likely corrupted)
+                                    if file_size < 100:
+                                        os.remove(arrow_file)
+                                        print(f"    Removed small/corrupted file: {arrow_file}")
+                                except Exception:
+                                    pass
+                except Exception as cleanup_error:
+                    print(f"  ⚠ Could not clean cache: {cleanup_error}")
+                
+                import time
+                time.sleep(eval_retry_delay)
+                continue
+            else:
+                # Not an Arrow error, or max retries reached - re-raise
+                print(f"\n✗ ERROR: Evaluation failed: {e}")
+                raise
     
     # Convert scores to JSON-serializable format
     # scores might contain non-serializable objects, so we need to clean it
@@ -1604,28 +1755,38 @@ def train_t5_axis(
         "svd_threshold": svd_threshold,
         "seed": seed,
         "scores": scores_serializable,
-        "experiment_dir": experiment_dir,
+        "experiment_dir": "",  # No longer using separate experiment directories
         "timestamp": datetime.now().isoformat(),
         "batches_seen": batches_seen,
         "early_stopping_triggered": early_stopping_triggered,
     }
-    
-    results_path = os.path.join(experiment_dir, "results.json")
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
     
     # Save singular values
     singular_values = {}
     for key, param in model.learnable_s_values.items():
         singular_values[key] = param.detach().cpu().tolist()
     
-    sv_path = os.path.join(experiment_dir, "singular_values.json")
-    with open(sv_path, 'w') as f:
-        json.dump(singular_values, f, indent=2)
+    # Append results and singular values to job log file if available
+    if job_log_file:
+        try:
+            with open(job_log_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n{'='*80}\n")
+                f.write(f"RESULTS AND SINGULAR VALUES\n")
+                f.write(f"{'='*80}\n")
+                f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+                f.write(f"Results JSON:\n")
+                f.write(json.dumps(results, indent=2))
+                f.write(f"\n\nSingular Values JSON:\n")
+                f.write(json.dumps(singular_values, indent=2))
+                f.write(f"\n{'='*80}\n")
+                f.flush()
+            print(f"✓ Results and singular values appended to job log: {job_log_file}")
+        except Exception as e:
+            print(f"⚠ Warning: Could not append results to job log file: {e}")
+    else:
+        print(f"⚠ Warning: job_log_file not provided, results not saved to log")
     
-    print(f"✓ Results saved to: {experiment_dir}")
-    print(f"  - results.json: {results_path}")
-    print(f"  - singular_values.json: {sv_path}")
+    print(f"✓ Results prepared (saved to job log file)")
     
     if is_nodeZero(device):
         print(f"\n✓ Evaluation completed")
@@ -1704,6 +1865,259 @@ def main(args):
     csv_filename = f"t5_axis_results_{timestamp_str}_job{slurm_job_id}.csv"
     csv_path = os.path.join(csv_dir, csv_filename)
     
+    # Setup experiment status tracking file
+    if args.status_file:
+        # Use provided status file path
+        status_file = args.status_file
+        status_dir = os.path.dirname(status_file)
+        os.makedirs(status_dir, exist_ok=True)
+    else:
+        # Use default status file path
+        status_dir = "exp_out/t5_axis"
+        os.makedirs(status_dir, exist_ok=True)
+        status_file = os.path.join(status_dir, "experiment_status.csv")
+    
+    # Setup job-specific log directory and log file
+    job_log_dir = os.path.join(status_dir, f"slurm_{slurm_job_id}")
+    os.makedirs(job_log_dir, exist_ok=True)
+    job_log_file = os.path.join(job_log_dir, "log.txt")
+    
+    # Helper function to log experiment configuration
+    def log_experiment_config(source_datasets, target_dataset, svd_threshold, seed, 
+                              status, experiment_dir=None, accuracy=None, error=None):
+        """Log experiment configuration to job-specific log file."""
+        source_str = " | ".join(sorted(source_datasets))
+        timestamp = datetime.now().isoformat()
+        
+        log_entry = f"\n{'='*80}\n"
+        log_entry += f"Timestamp: {timestamp}\n"
+        log_entry += f"Status: {status}\n"
+        log_entry += f"Configuration:\n"
+        log_entry += f"  - Source datasets: {source_str}\n"
+        log_entry += f"  - Target dataset: {target_dataset}\n"
+        log_entry += f"  - SVD threshold: {svd_threshold}\n"
+        log_entry += f"  - Seed: {seed}\n"
+        if experiment_dir:
+            log_entry += f"  - Experiment dir: {experiment_dir}\n"
+        if accuracy is not None:
+            log_entry += f"  - Accuracy: {accuracy:.4f}\n"
+        if error:
+            log_entry += f"  - Error: {error}\n"
+        log_entry += f"{'='*80}\n"
+        
+        try:
+            with open(job_log_file, 'a', encoding='utf-8') as f:
+                f.write(log_entry)
+                f.flush()
+        except Exception as e:
+            print(f"⚠ Warning: Could not write to log file {job_log_file}: {e}")
+    
+    # Initialize log file with header
+    if not os.path.exists(job_log_file):
+        try:
+            with open(job_log_file, 'w', encoding='utf-8') as f:
+                f.write("="*80 + "\n")
+                f.write(f"T5 AXIS Training Log - SLURM Job ID: {slurm_job_id}\n")
+                f.write(f"Started: {datetime.now().isoformat()}\n")
+                f.write("="*80 + "\n")
+                f.write(f"Workflow: {'NEW (outer loop over targets)' if use_new_workflow else 'OLD (sequential sources)'}\n")
+                if use_new_workflow:
+                    f.write(f"Target: {args.target}\n")
+                    f.write(f"Source range: {args.min_sources} to {args.max_sources}\n")
+                else:
+                    f.write(f"Resume from idx: {args.resume_from_idx}\n")
+                    f.write(f"End index: {args.end_index}\n")
+                f.write("="*80 + "\n\n")
+                f.flush()
+        except Exception as e:
+            print(f"⚠ Warning: Could not create log file {job_log_file}: {e}")
+    
+    print(f"✓ Job log file: {job_log_file}")
+    
+    # Helper function to create unique experiment key
+    def create_experiment_key(source_datasets, target_dataset, svd_threshold, seed):
+        """Create unique key for experiment identification."""
+        # Sort source datasets for consistent key generation
+        sorted_sources = sorted(source_datasets)
+        source_str = " | ".join(sorted_sources)
+        return f"{source_str}__{target_dataset}__{svd_threshold}__{seed}"
+    
+    # Helper function to safely read status file with file locking
+    def read_status_file_with_lock(status_file):
+        """Read status file with file locking to prevent race conditions."""
+        import fcntl
+        import time
+        
+        max_retries = 10
+        retry_delay = 0.1  # 100ms
+        
+        for attempt in range(max_retries):
+            try:
+                # Try to open and lock file
+                with open(status_file, 'r', encoding='utf-8') as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)  # Shared lock for reading
+                    df_status = pd.read_csv(f)
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Release lock
+                    return df_status
+            except FileNotFoundError:
+                # File doesn't exist yet - return empty DataFrame
+                return pd.DataFrame(columns=[
+                    "source_datasets", "target_dataset", "svd_threshold", "seed",
+                    "status", "experiment_dir", "timestamp_start", "timestamp_end"
+                ])
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                    continue
+                else:
+                    print(f"⚠ Warning: Could not read status file {status_file} after {max_retries} attempts: {e}")
+                    # Return empty DataFrame as fallback
+                    return pd.DataFrame(columns=[
+                        "source_datasets", "target_dataset", "svd_threshold", "seed",
+                        "status", "experiment_dir", "timestamp_start", "timestamp_end"
+                    ])
+        return pd.DataFrame(columns=[
+            "source_datasets", "target_dataset", "svd_threshold", "seed",
+            "status", "experiment_dir", "timestamp_start", "timestamp_end"
+        ])
+    
+    # Helper function to check if experiment is finished
+    def is_experiment_finished(source_datasets, target_dataset, svd_threshold, seed, status_file):
+        """Check if experiment with given configuration is already finished."""
+        if not os.path.exists(status_file):
+            return False
+        
+        try:
+            df_status = read_status_file_with_lock(status_file)
+            
+            # Check if experiment exists and is finished
+            mask = (
+                (df_status['source_datasets'] == " | ".join(sorted(source_datasets))) &
+                (df_status['target_dataset'] == target_dataset) &
+                (df_status['svd_threshold'] == svd_threshold) &
+                (df_status['seed'] == seed)
+            )
+            
+            if mask.any():
+                # Get first matching row index
+                matching_indices = df_status.index[mask]
+                if len(matching_indices) > 0:
+                    idx = matching_indices[0]
+                    status = df_status.loc[idx, 'status']
+                    return status == 'finished'
+            return False
+        except Exception as e:
+            print(f"⚠ Warning: Could not check status file {status_file}: {e}")
+            return False
+    
+    # Helper function to update experiment status with file locking
+    def update_experiment_status(source_datasets, target_dataset, svd_threshold, seed, 
+                                 status, experiment_dir=None, status_file=status_file):
+        """Update or create experiment status entry with file locking to prevent race conditions."""
+        import fcntl
+        import time
+        
+        source_str = " | ".join(sorted(source_datasets))
+        timestamp_now = datetime.now().isoformat()
+        
+        max_retries = 10
+        retry_delay = 0.1  # 100ms
+        
+        for attempt in range(max_retries):
+            try:
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(status_file), exist_ok=True)
+                
+                # Check if file exists and has content
+                file_exists = os.path.exists(status_file) and os.path.getsize(status_file) > 0
+                
+                # Open file with exclusive lock for read+write
+                # Use 'r+' if file exists, 'w+' if it doesn't (creates new file)
+                file_mode = 'r+' if file_exists else 'w+'
+                with open(status_file, file_mode, encoding='utf-8') as f:
+                    # Try to acquire exclusive lock (blocks until available)
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    
+                    # Read existing data
+                    if file_exists:
+                        try:
+                            f.seek(0)  # Move to beginning
+                            df_status = pd.read_csv(f)
+                            # Ensure all required columns exist
+                            required_cols = [
+                                "source_datasets", "target_dataset", "svd_threshold", "seed",
+                                "status", "experiment_dir", "timestamp_start", "timestamp_end"
+                            ]
+                            for col in required_cols:
+                                if col not in df_status.columns:
+                                    df_status[col] = ""
+                        except Exception as e:
+                            # If CSV is corrupted or empty, start fresh
+                            print(f"⚠ Warning: Could not read status file, starting fresh: {e}")
+                            df_status = pd.DataFrame(columns=[
+                                "source_datasets", "target_dataset", "svd_threshold", "seed",
+                                "status", "experiment_dir", "timestamp_start", "timestamp_end"
+                            ])
+                    else:
+                        # File doesn't exist - create empty DataFrame with headers
+                        df_status = pd.DataFrame(columns=[
+                            "source_datasets", "target_dataset", "svd_threshold", "seed",
+                            "status", "experiment_dir", "timestamp_start", "timestamp_end"
+                        ])
+                    
+                    # Check if entry exists
+                    mask = (
+                        (df_status['source_datasets'] == source_str) &
+                        (df_status['target_dataset'] == target_dataset) &
+                        (df_status['svd_threshold'] == svd_threshold) &
+                        (df_status['seed'] == seed)
+                    )
+                    
+                    if mask.any():
+                        # Update existing entry
+                        matching_indices = df_status.index[mask]
+                        if len(matching_indices) > 0:
+                            idx = matching_indices[0]
+                            df_status.loc[idx, 'status'] = status
+                            df_status.loc[idx, 'timestamp_end'] = timestamp_now
+                            if experiment_dir:
+                                df_status.loc[idx, 'experiment_dir'] = experiment_dir
+                    else:
+                        # Create new entry
+                        new_row = {
+                            "source_datasets": source_str,
+                            "target_dataset": target_dataset,
+                            "svd_threshold": svd_threshold,
+                            "seed": seed,
+                            "status": status,
+                            "experiment_dir": experiment_dir if experiment_dir else "",
+                            "timestamp_start": timestamp_now,
+                            "timestamp_end": timestamp_now if status in ['finished', 'failed'] else ""
+                        }
+                        df_status = pd.concat([df_status, pd.DataFrame([new_row])], ignore_index=True)
+                    
+                    # Write back to file (truncate first)
+                    f.seek(0)
+                    f.truncate()
+                    df_status.to_csv(f, index=False)
+                    f.flush()
+                    os.fsync(f.fileno())  # Force write to disk
+                    
+                    # Release lock
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    
+                    # Success - break out of retry loop
+                    break
+                    
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                    continue
+                else:
+                    print(f"⚠ Warning: Could not save status file {status_file} after {max_retries} attempts: {e}")
+                    import traceback
+                    traceback.print_exc()
+    
     # Get reverse flag from args (default False)
     reverse_flag = getattr(args, 'reverse', False)
     
@@ -1720,6 +2134,8 @@ def main(args):
         print(f"✓ Created CSV file: {csv_path}")
     else:
         print(f"✓ Appending to existing CSV file: {csv_path}")
+    
+    print(f"✓ Experiment status tracking: {status_file}")
     
     # NEW WORKFLOW: Outer loop over targets, inner loop over all source combinations
     if use_new_workflow:
@@ -1756,6 +2172,17 @@ def main(args):
                     
                     print(f"\n  - Source: {source_datasets} → Target: {target_dataset_name}")
                     
+                    # Check if experiment is already finished
+                    if is_experiment_finished(source_datasets, target_dataset_name, args.svd_threshold, args.seed, status_file):
+                        print(f"    ⏭ SKIPPED: Experiment already finished (source={source_datasets}, target={target_dataset_name}, svd={args.svd_threshold}, seed={args.seed})")
+                        log_experiment_config(source_datasets, target_dataset_name, args.svd_threshold, args.seed,
+                                            status='skipped', error="Already finished in previous run")
+                        continue
+                    
+                    # Log experiment start
+                    log_experiment_config(source_datasets, target_dataset_name, args.svd_threshold, args.seed,
+                                        status='running')
+                    
                     try:
                         # Train
                         results = train_t5_axis(
@@ -1769,6 +2196,7 @@ def main(args):
                             device=device,
                             world_size=1,
                             rank=0,
+                            job_log_file=job_log_file,  # Pass job log file for centralized logging
                         )
                         
                         # Extract accuracy from scores
@@ -1804,7 +2232,7 @@ def main(args):
                             "seed": args.seed,
                             "accuracy": accuracy if accuracy is not None else None,
                             "scores": json.dumps(scores) if scores else None,
-                            "experiment_dir": results.get("experiment_dir", ""),
+                            "experiment_dir": "",  # No longer using separate experiment directories
                             "timestamp": results.get("timestamp", datetime.now().isoformat()),
                             "batches_seen": results.get("batches_seen", None),
                             "early_stopping_triggered": results.get("early_stopping_triggered", False),
@@ -1825,8 +2253,21 @@ def main(args):
                         
                         print(f"    ✓ Successfully completed: source={source_datasets}, target={target_dataset_name}")
                         
+                        # Mark experiment as finished (no experiment_dir - using job log file instead)
+                        update_experiment_status(source_datasets, target_dataset_name, args.svd_threshold, args.seed,
+                                                status='finished', experiment_dir=None, status_file=status_file)
+                        
+                        # Log experiment completion (no experiment_dir - using job log file instead)
+                        log_experiment_config(source_datasets, target_dataset_name, args.svd_threshold, args.seed,
+                                            status='finished', experiment_dir=None, accuracy=accuracy)
+                        
                     except Exception as e:
                         print(f"\n    ✗ ERROR: source={source_datasets}, target={target_dataset_name} failed with error: {e}")
+                        
+                        # Log experiment failure (but don't save to status file - only 'finished' is saved)
+                        log_experiment_config(source_datasets, target_dataset_name, args.svd_threshold, args.seed,
+                                            status='failed', error=str(e))
+                        
                         import traceback
                         traceback.print_exc()
                         print("\n    " + "=" * 100)
@@ -1867,10 +2308,21 @@ def main(args):
         
         # Iterate over all target datasets
         for target_dataset_name in target_datasets:
+            # Check if experiment is already finished
+            if is_experiment_finished(source_datasets, target_dataset_name, args.svd_threshold, args.seed, status_file):
+                print(f"\n⏭ SKIPPED: Experiment already finished (source={source_datasets}, target={target_dataset_name}, svd={args.svd_threshold}, seed={args.seed})")
+                log_experiment_config(source_datasets, target_dataset_name, args.svd_threshold, args.seed,
+                                    status='skipped', error="Already finished in previous run")
+                continue
+            
             try:
                 print("\n" + "-" * 100)
                 print(f"Training with source tasks {source_datasets} for target task {target_dataset_name}")
                 print("-" * 100)
+                
+                # Log experiment start
+                log_experiment_config(source_datasets, target_dataset_name, args.svd_threshold, args.seed,
+                                    status='running')
                 
                 # Train
                 results = train_t5_axis(
@@ -1884,6 +2336,7 @@ def main(args):
                     device=device,
                     world_size=1,
                     rank=0,
+                    job_log_file=job_log_file,  # Pass job log file for centralized logging
                 )
                 
                 # Extract accuracy from scores
@@ -1944,8 +2397,21 @@ def main(args):
                 
                 print(f"✓ Successfully completed: source={source_datasets}, target={target_dataset_name}")
                 
+                # Mark experiment as finished (no experiment_dir - using job log file instead)
+                update_experiment_status(source_datasets, target_dataset_name, args.svd_threshold, args.seed,
+                                        status='finished', experiment_dir=None, status_file=status_file)
+                
+                # Log experiment completion (no experiment_dir - using job log file instead)
+                log_experiment_config(source_datasets, target_dataset_name, args.svd_threshold, args.seed,
+                                    status='finished', experiment_dir=None, accuracy=accuracy)
+                
             except Exception as e:
                 print(f"\n✗ ERROR: source={source_datasets}, target={target_dataset_name} failed with error: {e}")
+                
+                # Log experiment failure (but don't save to status file - only 'finished' is saved)
+                log_experiment_config(source_datasets, target_dataset_name, args.svd_threshold, args.seed,
+                                    status='failed', error=str(e))
+                
                 import traceback
                 traceback.print_exc()
                 print("\n" + "=" * 100)
@@ -1977,6 +2443,7 @@ if __name__ == "__main__":
     parser.add_argument("--target", type=str, default=None, help="Target dataset name (if specified, uses new workflow: outer loop over targets, inner loop over all source combinations)")
     parser.add_argument("--min-sources", type=int, default=1, help="Minimum number of source datasets (for new workflow, default: 1)")
     parser.add_argument("--max-sources", type=int, default=6, help="Maximum number of source datasets (for new workflow, default: 6)")
+    parser.add_argument("--status-file", type=str, default=None, help="Path to experiment status CSV file (default: exp_out/t5_axis/experiment_status.csv)")
     
     args = parser.parse_args()
     

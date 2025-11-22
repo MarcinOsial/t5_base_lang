@@ -57,7 +57,7 @@ def _patch_download_config_for_compatibility():
         DownloadConfig.copy._patched = True
 
 
-def _load_metric_safely(metric_name):
+def _load_metric_safely(metric_name, experiment_id=None):
     """
     Load metric with fallback for compatibility issues between evaluate and datasets versions.
     
@@ -66,6 +66,8 @@ def _load_metric_safely(metric_name):
     
     Args:
         metric_name: Name of the metric to load (e.g., "accuracy", "squad")
+        experiment_id: Unique identifier for this experiment to avoid cache collisions
+                      between parallel evaluation instances (e.g., from multiple SLURM jobs)
     
     Returns:
         Loaded metric object
@@ -74,15 +76,21 @@ def _load_metric_safely(metric_name):
     _patch_download_config_for_compatibility()
     
     try:
-        # Try loading with default configuration first
-        return load(metric_name)
+        # Try loading with default configuration first, including experiment_id if provided
+        if experiment_id is not None:
+            return load(metric_name, experiment_id=experiment_id)
+        else:
+            return load(metric_name)
     except (AttributeError, TypeError) as e:
         error_msg = str(e)
         # Check if error is related to DownloadConfig.token attribute
         if "'DownloadConfig' object has no attribute 'token'" in error_msg or "token" in error_msg.lower():
             # Fallback 1: Try loading with download_config=None to avoid token issue
             try:
-                return load(metric_name, download_config=None)
+                if experiment_id is not None:
+                    return load(metric_name, download_config=None, experiment_id=experiment_id)
+                else:
+                    return load(metric_name, download_config=None)
             except Exception as e2:
                 # Fallback 2: Try with a custom DownloadConfig that explicitly handles token
                 try:
@@ -94,12 +102,18 @@ def _load_metric_safely(metric_name):
                             download_config.token = None
                         except (AttributeError, TypeError):
                             pass
-                    return load(metric_name, download_config=download_config)
+                    if experiment_id is not None:
+                        return load(metric_name, download_config=download_config, experiment_id=experiment_id)
+                    else:
+                        return load(metric_name, download_config=download_config)
                 except Exception as e3:
                     # Fallback 3: Try loading without any download_config parameter
                     # This might work if the library can create its own config
                     try:
-                        return load(metric_name)
+                        if experiment_id is not None:
+                            return load(metric_name, experiment_id=experiment_id)
+                        else:
+                            return load(metric_name)
                     except Exception:
                         # If all else fails, raise the original error with context
                         raise RuntimeError(
@@ -113,19 +127,26 @@ def _load_metric_safely(metric_name):
 
 
 class Scorer(object):
-    def __init__(self, metrics):
-
+    def __init__(self, metrics, experiment_id=None):
+        """
+        Initialize Scorer with metrics.
+        
+        Args:
+            metrics: List of metric names to compute
+            experiment_id: Unique identifier for this experiment to avoid cache collisions
+                          between parallel evaluation instances (e.g., from multiple SLURM jobs)
+        """
         self.metrics_toCompute = {"accuracy": False, "squad": False}
 
         if "Accuracy" in metrics:
             self.metrics_toCompute["accuracy"] = True
             # Use safe loading to handle version incompatibility issues
-            self.accuracy_metric = _load_metric_safely("accuracy")
+            self.accuracy_metric = _load_metric_safely("accuracy", experiment_id=experiment_id)
 
         if "Squad" in metrics:
             self.metrics_toCompute["squad"] = True
             # Use safe loading to handle version incompatibility issues
-            self.squad_metric = _load_metric_safely("squad")
+            self.squad_metric = _load_metric_safely("squad", experiment_id=experiment_id)
 
     def add_batch(self, batchOf_evalInfo):
         """

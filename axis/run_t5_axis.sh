@@ -63,15 +63,20 @@ if [ "$WORKFLOW_MODE" = "new" ]; then
     echo "Using NEW WORKFLOW: Outer loop over targets, all source combinations"
     
     # Target datasets to iterate over (outer loop)
-    TARGETS=("paws" "qasc" "quartz" "story_cloze" "wiki_qa" "winogrande" "wsc")
+    # "paws" "qasc" "quartz" "story_cloze" "wiki_qa" "winogrande" "wsc"
+    TARGETS=("wsc")
+
     
     # Source combination range
     MIN_SOURCES=1  # Minimum number of source datasets
     MAX_SOURCES=6  # Maximum number of source datasets
     
     # SVD thresholds to test
-    SVD_THRESHOLDS=(0.1) # 0.2 0.4 0.6 0.8 1.0
+    SVD_THRESHOLDS=(1.0) # 0.2 0.4 0.6 0.8 1.0
     SEEDs=(42)
+    
+    # Experiment status file path (can be customized)
+    STATUS_FILE="${PROJECT_DIR}/exp_out/t5_axis/experiment_status_3.csv"
     
     for SEED in "${SEEDs[@]}"; do
         for SVD_THRESHOLD in "${SVD_THRESHOLDS[@]}"; do
@@ -80,6 +85,7 @@ if [ "$WORKFLOW_MODE" = "new" ]; then
                 echo "Target dataset: $TARGET"
                 echo "Source combinations: $MIN_SOURCES to $MAX_SOURCES sources"
                 echo "This will test ALL combinations of source datasets (excluding target)"
+                echo "Status file: $STATUS_FILE"
                 python -m axis.t5_axis_merging \
                     --target=$TARGET \
                     --min-sources=$MIN_SOURCES \
@@ -87,7 +93,8 @@ if [ "$WORKFLOW_MODE" = "new" ]; then
                     --svd-threshold=$SVD_THRESHOLD \
                     --model=$MODEL \
                     --seed=$SEED \
-                    --config=axis/configs/t5_axis_training.json
+                    --config=axis/configs/t5_axis_training_3.json \
+                    --status-file="$STATUS_FILE"
             done
         done
     done
@@ -113,6 +120,9 @@ else
     SVD_THRESHOLDS=(0.1 0.2 0.4 0.6 0.8 1.0)
     SEEDs=(42)
     
+    # Experiment status file path (can be customized)
+    STATUS_FILE="${PROJECT_DIR}/exp_out/t5_axis/experiment_status_2.csv"
+    
     for SEED in "${SEEDs[@]}"; do
         for SVD_THRESHOLD in "${SVD_THRESHOLDS[@]}"; do
             for i in "${!RESUME_IDXs[@]}"; do
@@ -123,13 +133,15 @@ else
                 echo "This will iterate over:"
                 echo "  - Source datasets: from ${pool[@]:0:$((RESUME_IDX+1))} to ${pool[@]:0:$END_IDX}"
                 echo "  - Target datasets: all remaining datasets (not in source)"
+                echo "Status file: $STATUS_FILE"
                 python -m axis.t5_axis_merging \
                     --svd-threshold=$SVD_THRESHOLD \
                     --model=$MODEL \
                     --resume-from-idx=$RESUME_IDX \
                     --end-index=$END_IDX \
                     --seed=$SEED \
-                    --config=axis/configs/t5_axis_training.json
+                    --config=axis/configs/t5_axis_training_2.json \
+                    --status-file="$STATUS_FILE"
             done
         done
     done

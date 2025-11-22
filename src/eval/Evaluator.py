@@ -7,7 +7,7 @@ from src.eval.utils import get_dirAndRunIdx_fromPredictionFp
 
 
 class Evaluator(object):
-    def __init__(self, metrics, prediction_fp, should_save_to_gcp):
+    def __init__(self, metrics, prediction_fp, should_save_to_gcp, experiment_id=None):
         """
         Evaluates all metrics for a dataset
 
@@ -15,8 +15,10 @@ class Evaluator(object):
             metrics:
             prediction_fp:
             should_save_to_gcp:
+            experiment_id: Unique identifier for this experiment to avoid cache collisions
+                           between parallel evaluation instances (e.g., from multiple SLURM jobs)
         """
-        self.scorer = Scorer(metrics)
+        self.scorer = Scorer(metrics, experiment_id=experiment_id)
         self.prediction_fp = prediction_fp
 
         if self.prediction_fp is not None:

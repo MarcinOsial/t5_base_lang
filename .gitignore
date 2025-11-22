@@ -4,7 +4,7 @@ __pycache__
 .history/
 .wandb/
 
-*.md
+
 datasets/
 exp_out/
 models/

@@ -25,7 +25,7 @@ logger = logging.getLogger("root")
 
 
 def evaluate_model(
-    model, batch_iterator, metrics, evaluation_config, specificPrediction_dir, device
+    model, batch_iterator, metrics, evaluation_config, specificPrediction_dir, device, experiment_id=None
 ):
     """
 
@@ -96,7 +96,7 @@ def evaluate_model(
         # evaluator must be created after checking if the cache of model predictions exists,
         # since evaluator creates the prediction fp
         evaluator = Evaluator(
-            metrics, prediction_fp, evaluation_config.should_save_to_gcp
+            metrics, prediction_fp, evaluation_config.should_save_to_gcp, experiment_id=experiment_id
         )
 
     model.eval()
@@ -196,7 +196,7 @@ def evaluate_model(
 
 
 def evaluate_fromConfig(
-    model, tokenizer, cached_datasetReaders, evaluation_config, device
+    model, tokenizer, cached_datasetReaders, evaluation_config, device, experiment_id=None
 ):
     """
 
@@ -279,6 +279,7 @@ def evaluate_fromConfig(
             evaluation_config,
             specificPrediction_dir,
             device,
+            experiment_id=experiment_id,  # Pass experiment_id to avoid cache collisions
         ),
         cached_datasetReaders,
     )
